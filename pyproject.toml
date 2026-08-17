@@ -136,5 +136,5 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
-markers = ["manual: should be run manually."]
+markers = ["manual: should be run manually.", "slow: slow tests, run separately with -m slow."]
 testpaths = ["src", "scripts", "packages"]

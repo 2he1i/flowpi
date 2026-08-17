@@ -81,6 +81,10 @@ class SeaRaftFlowExtractor:
         self._device = torch.device(device)
 
         raft_cls = _import_raft()
+        # Deterministic random init when no checkpoint is given, so that separate processes
+        # (cache precomputation vs. online testing) produce comparable flows.
+        if ckpt_path is None:
+            torch.manual_seed(0)
         self._model = raft_cls(args).to(self._device).eval()
         for p in self._model.parameters():
             p.requires_grad = False

@@ -336,8 +336,15 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
                 outputs=data_transforms.outputs,
             )
             # The flow transforms need episode/frame indices to address the cache and validity.
-            repack_transforms = repack_transforms.push(
-                inputs=[_transforms.RepackTransform({"episode_index": "episode_index", "frame_index": "frame_index"})],
+            # Merge them into the main repack structure (RepackTransform drops unmapped keys).
+            repack_transforms = _transforms.Group(
+                inputs=tuple(
+                    dataclasses.replace(transform, structure={**transform.structure, "episode_index": "episode_index", "frame_index": "frame_index"})
+                    if isinstance(transform, _transforms.RepackTransform)
+                    else transform
+                    for transform in repack_transforms.inputs
+                ),
+                outputs=repack_transforms.outputs,
             )
 
         return dataclasses.replace(

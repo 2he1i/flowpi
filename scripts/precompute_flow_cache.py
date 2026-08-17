@@ -80,6 +80,12 @@ def _decode_episode_frames(root: pathlib.Path, entry: dict, cam_keys: list[str])
     return out
 
 
+def _cache_name(cam_key: str) -> str:
+    """Cache file name for a camera: the dataset key with the 'observation.images.' prefix stripped,
+    matching the post-repack camera names used by LoadFlowCache."""
+    return cam_key.removeprefix("observation.images.")
+
+
 def _process_episode(task: dict) -> dict:
     """Worker: computes and saves the flow cache for one episode."""
     from openpi.training.sea_raft import SeaRaftFlowExtractor  # noqa: PLC0415
@@ -118,7 +124,7 @@ def _process_episode(task: dict) -> dict:
             flows[cam][t, k - 1] = flow.astype(np.float16)
 
     for cam in task["cam_keys"]:
-        np.save(ep_dir / f"{cam}.npy", flows[cam])
+        np.save(ep_dir / f"{_cache_name(cam)}.npy", flows[cam])
     np.save(ep_dir / "valid.npy", valid)
     return {"episode": entry["episode_index"], "num_pairs": len(pairs)}
 

@@ -1,7 +1,9 @@
 from collections.abc import Iterator, Sequence
+import json
 import logging
 import multiprocessing
 import os
+import pathlib
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
@@ -137,18 +139,92 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
-    )
+    delta_timestamps: dict[str, list[float]] = {
+        key: [t / dataset_fps(repo_id) for t in range(action_horizon)] for key in data_config.action_sequence_keys
+    }
+
+    # Load camera history frames for the flow fast-path / slow-channel delay window.
+    flow = data_config.flow
+    if flow is not None and flow.enabled:
+        model_flow = getattr(model_config, "flow", None)
+        if model_flow is None or not model_flow.enabled:
+            raise ValueError("data.flow.enabled requires model.flow to be enabled.")
+        fps = dataset_fps(repo_id)
+        frame_offsets = _transforms.compute_image_frame_offsets(
+            model_flow.num_flow_steps, model_flow.flow_stride_frames, model_flow.vlm_delay_max
+        )
+        for cam_key in dataset_camera_keys(repo_id):
+            delta_timestamps[cam_key] = [-o / fps for o in frame_offsets]
+
+    dataset = make_lerobot_dataset(repo_id, delta_timestamps)
 
     if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_tasks(repo_id))])
 
     return dataset
+
+
+def _resolve_dataset_path(repo_id: str) -> pathlib.Path | None:
+    """Returns the local dataset root if `repo_id` points at a local LeRobot dataset directory."""
+    if "://" in repo_id:
+        return None
+    path = pathlib.Path(repo_id)
+    return path if (path / "meta" / "info.json").exists() else None
+
+
+_LEROBOT_DATASET_CACHE: dict[str, object] = {}
+
+
+def _get_lerobot_dataset(repo_id: str):
+    """Creates (and caches) the base dataset object for `repo_id` without delta_timestamps."""
+    if repo_id in _LEROBOT_DATASET_CACHE:
+        return _LEROBOT_DATASET_CACHE[repo_id]
+
+    local_path = _resolve_dataset_path(repo_id)
+    if local_path is not None:
+        with open(local_path / "meta" / "info.json") as f:
+            info = json.load(f)
+        if str(info.get("codebase_version", "")).startswith("v3"):
+            import openpi.training.lerobot_v3_dataset as lerobot_v3_dataset  # noqa: PLC0415
+
+            dataset = lerobot_v3_dataset.LeRobotV3ParquetDataset(local_path)
+        else:
+            dataset = lerobot_dataset.LeRobotDataset(repo_id, root=str(local_path))
+    else:
+        dataset = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    _LEROBOT_DATASET_CACHE[repo_id] = dataset
+    return dataset
+
+
+def dataset_fps(repo_id: str) -> int:
+    dataset = _get_lerobot_dataset(repo_id)
+    return int(dataset.meta.fps if hasattr(dataset, "meta") else dataset.fps)
+
+
+def dataset_camera_keys(repo_id: str) -> list[str]:
+    dataset = _get_lerobot_dataset(repo_id)
+    meta = getattr(dataset, "meta", dataset)
+    return list(meta.camera_keys)
+
+
+def dataset_tasks(repo_id: str) -> dict[int, str]:
+    dataset = _get_lerobot_dataset(repo_id)
+    meta = getattr(dataset, "meta", dataset)
+    return dict(meta.tasks)
+
+
+def make_lerobot_dataset(repo_id: str, delta_timestamps: dict[str, list[float]]):
+    """Creates a LeRobot dataset (v2 via lerobot package, v3 via the local parquet reader)."""
+    local_path = _resolve_dataset_path(repo_id)
+    if local_path is not None:
+        with open(local_path / "meta" / "info.json") as f:
+            info = json.load(f)
+        if str(info.get("codebase_version", "")).startswith("v3"):
+            import openpi.training.lerobot_v3_dataset as lerobot_v3_dataset  # noqa: PLC0415
+
+            return lerobot_v3_dataset.LeRobotV3ParquetDataset(local_path, delta_timestamps=delta_timestamps)
+        return lerobot_dataset.LeRobotDataset(repo_id, root=str(local_path), delta_timestamps=delta_timestamps)
+    return lerobot_dataset.LeRobotDataset(repo_id, delta_timestamps=delta_timestamps)
 
 
 def create_rlds_dataset(

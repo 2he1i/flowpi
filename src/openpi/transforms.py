@@ -1,5 +1,6 @@
 from collections.abc import Callable, Mapping, Sequence
 import dataclasses
+import pathlib
 import re
 from typing import Protocol, TypeAlias, TypeVar, runtime_checkable
 
@@ -334,6 +335,208 @@ class PadStatesAndActions(DataTransformFn):
         data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis=-1)
         if "actions" in data:
             data["actions"] = pad_to_dim(data["actions"], self.model_action_dim, axis=-1)
+        return data
+
+
+# --------------------------------------------------------------------------------------------------
+# flowpi: flow / slow-channel-delay transforms.
+# --------------------------------------------------------------------------------------------------
+
+
+def compute_image_frame_offsets(num_flow_steps: int, flow_stride_frames: int, vlm_delay_max: int) -> tuple[int, ...]:
+    """Computes the set of *negative* frame offsets (into the past) that must be loaded for the image
+    keys: one frame per flow lag (`k * flow_stride_frames` for `k = 1..num_flow_steps`) plus the slow
+    channel delay window (`1..vlm_delay_max`), always including the current frame (offset 0).
+
+    Returned in ascending (oldest-first) order, matching the `delta_timestamps` convention
+    `[(-i) / fps for i in vlm_delay_max..0]`.
+    """
+    offsets = {0}
+    offsets.update(k * flow_stride_frames for k in range(1, num_flow_steps + 1))
+    offsets.update(range(1, vlm_delay_max + 1))
+    return tuple(-o for o in sorted(offsets, reverse=True))
+
+
+def frame_offset_index(frame_offsets: tuple[int, ...], offset: int) -> int:
+    """Returns the stacking index of `offset` within a stack ordered like `frame_offsets`."""
+    return frame_offsets.index(offset)
+
+
+def normalize_flow(flow: np.ndarray, flow_scale: float, flow_clamp: float) -> np.ndarray:
+    """Scales and clamps raw pixel flow to the normalized range used by the model."""
+    return np.clip(flow.astype(np.float32) / flow_scale, -flow_clamp, flow_clamp)
+
+
+class LoadFlowCache(DataTransformFn):
+    """Loads precomputed raw SEA-RAFT flow from the offline cache (training path).
+
+    Expected cache layout (produced by `scripts/precompute_flow_cache.py`):
+      {flow_cache_dir}/episode-{ep:06d}/{cam_key}.npy   # [T, K, 2, H//8, W//8] float16 (raw)
+      {flow_cache_dir}/episode-{ep:06d}/valid.npy       # [T, K] bool
+      {flow_cache_dir}/meta.json                        # K / stride / resolution checks
+
+    Produces `data["flow"] = {cam_key: [K, 2, h, w]}` (normalized) and
+    `data["flow_masks"] = {cam_key: [K]}` (per-lag validity).
+    """
+
+    def __init__(
+        self,
+        flow_cache_dir: str,
+        cam_keys: Sequence[str],
+        *,
+        num_flow_steps: int,
+        flow_stride_frames: int,
+        flow_image_size: tuple[int, int],
+        flow_scale: float,
+        flow_clamp: float,
+    ):
+        self.flow_cache_dir = pathlib.Path(flow_cache_dir)
+        self.cam_keys = tuple(cam_keys)
+        self.num_flow_steps = num_flow_steps
+        self.flow_stride_frames = flow_stride_frames
+        self.flow_image_size = tuple(flow_image_size)
+        self.flow_scale = flow_scale
+        self.flow_clamp = flow_clamp
+        self._validate_meta()
+        self._mmaps: dict[int, tuple[dict[str, np.ndarray], np.ndarray]] = {}
+
+    def _validate_meta(self) -> None:
+        import json  # noqa: PLC0415
+
+        meta_path = self.flow_cache_dir / "meta.json"
+        if not meta_path.exists():
+            raise FileNotFoundError(f"Flow cache meta not found: {meta_path}. Run scripts/precompute_flow_cache.py first.")
+        with open(meta_path) as f:
+            meta = json.load(f)
+        expected = {
+            "num_flow_steps": self.num_flow_steps,
+            "flow_stride_frames": self.flow_stride_frames,
+            "image_size": list(self.flow_image_size),
+        }
+        for key, value in expected.items():
+            if key in meta and meta[key] != value:
+                raise ValueError(
+                    f"Flow cache mismatch for '{key}': cache has {meta[key]}, config expects {value}. "
+                    "Recompute the flow cache or update the config."
+                )
+
+    def _episode(self, episode_index: int) -> tuple[dict[str, np.ndarray], np.ndarray]:
+        cached = self._mmaps.get(episode_index)
+        if cached is None:
+            ep_dir = self.flow_cache_dir / f"episode-{episode_index:06d}"
+            flows = {cam: np.load(ep_dir / f"{cam}.npy", mmap_mode="r") for cam in self.cam_keys}
+            valid = np.load(ep_dir / "valid.npy")
+            cached = (flows, valid)
+            self._mmaps[episode_index] = cached
+        return cached
+
+    def __call__(self, data: DataDict) -> DataDict:
+        episode_index = int(np.asarray(data["episode_index"]).item())
+        frame_index = int(np.asarray(data["frame_index"]).item())
+        flows, valid = self._episode(episode_index)
+
+        data["flow"] = {}
+        data["flow_masks"] = {}
+        for cam in self.cam_keys:
+            raw = np.asarray(flows[cam][frame_index], dtype=np.float32)  # [K, 2, h, w]
+            if raw.shape[0] != self.num_flow_steps:
+                raise ValueError(f"Flow cache for {cam} has {raw.shape[0]} lags, expected {self.num_flow_steps}")
+            lag_valid = valid[frame_index].astype(bool)  # [K]
+            flow = normalize_flow(raw, self.flow_scale, self.flow_clamp)
+            flow = flow * lag_valid[:, None, None, None]
+            data["flow"][cam] = flow
+            data["flow_masks"][cam] = lag_valid
+        return data
+
+
+class ComputeFlow(DataTransformFn):
+    """Computes SEA-RAFT flow online from stacked camera history (inference / cache precomputation path).
+
+    Expects `data["images"][cam_key]` to be a stacked `[T, 3, H, W]` uint8 array ordered like
+    `frame_offsets` (oldest first, current frame at `frame_offset_index(frame_offsets, 0)`).
+    Produces the same `data["flow"]` / `data["flow_masks"]` structure as `LoadFlowCache`.
+    """
+
+    def __init__(
+        self,
+        extractor,
+        cam_keys: Sequence[str],
+        *,
+        num_flow_steps: int,
+        flow_stride_frames: int,
+        flow_scale: float,
+        flow_clamp: float,
+        frame_offsets: tuple[int, ...],
+    ):
+        self.extractor = extractor
+        self.cam_keys = tuple(cam_keys)
+        self.num_flow_steps = num_flow_steps
+        self.flow_stride_frames = flow_stride_frames
+        self.flow_scale = flow_scale
+        self.flow_clamp = flow_clamp
+        self.frame_offsets = tuple(frame_offsets)
+
+    def __call__(self, data: DataDict) -> DataDict:
+        frame_index = int(np.asarray(data["frame_index"]).item())
+        curr_idx = frame_offset_index(self.frame_offsets, 0)
+
+        prev_frames = []
+        curr_frames = []
+        lag_valid = np.ones(self.num_flow_steps, dtype=bool)
+        for k in range(1, self.num_flow_steps + 1):
+            lag_idx = frame_offset_index(self.frame_offsets, -k * self.flow_stride_frames)
+            for cam in self.cam_keys:
+                stack = np.asarray(data["images"][cam])
+                prev_frames.append(stack[lag_idx])
+                curr_frames.append(stack[curr_idx])
+            lag_valid[k - 1] = frame_index >= k * self.flow_stride_frames
+
+        prev = np.stack(prev_frames, axis=0)[None]  # [1, K*n_cam, 3, H, W]
+        curr = np.stack(curr_frames, axis=0)[None]
+        flow = self.extractor.compute(prev, curr)  # [1, K*n_cam, 2, H//8, W//8]
+        _, _, _, h8, w8 = flow.shape
+        flow = flow.reshape(self.num_flow_steps, len(self.cam_keys), 2, h8, w8)
+
+        data["flow"] = {}
+        data["flow_masks"] = {}
+        for cam_i, cam in enumerate(self.cam_keys):
+            raw = flow[:, cam_i]  # [K, 2, h, w]
+            normalized = normalize_flow(raw, self.flow_scale, self.flow_clamp)
+            normalized = normalized * lag_valid[:, None, None, None]
+            data["flow"][cam] = normalized
+            data["flow_masks"][cam] = lag_valid
+        return data
+
+
+class DelaySlowImage(DataTransformFn):
+    """Samples a slow-channel VLM delay `d_vlm ~ U{0..vlm_delay_max}` and selects the corresponding
+    delayed frame from the stacked camera history as the (single) prefix image.
+
+    Must run *before* the robot-specific inputs transform (e.g. `AlohaInputs`), while the images are
+    still stacked `[T, 3, H, W]` in `frame_offsets` order. When images are already single frames
+    (no history loaded), sets `data["vlm_delay"] = 0` and does nothing else.
+    """
+
+    def __init__(self, vlm_delay_max: int, frame_offsets: tuple[int, ...], *, seed: int = 0):
+        self.vlm_delay_max = vlm_delay_max
+        self.frame_offsets = tuple(frame_offsets)
+        self.seed = seed
+
+    def __call__(self, data: DataDict) -> DataDict:
+        images = data.get("images", {})
+        stacked = next(iter(images.values()), None)
+        if stacked is None or np.asarray(stacked).ndim != 4:
+            data["vlm_delay"] = 0
+            return data
+
+        episode_index = int(np.asarray(data["episode_index"]).item())
+        frame_index = int(np.asarray(data["frame_index"]).item())
+        rng = np.random.default_rng(self.seed * 1_000_003 + episode_index * 100_003 + frame_index)
+        d_vlm = int(rng.integers(0, self.vlm_delay_max + 1))
+
+        idx = frame_offset_index(self.frame_offsets, -d_vlm) if d_vlm > 0 else frame_offset_index(self.frame_offsets, 0)
+        data["images"] = {cam: np.asarray(stack)[idx] for cam, stack in images.items()}
+        data["vlm_delay"] = d_vlm
         return data
 
 

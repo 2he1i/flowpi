@@ -62,6 +62,20 @@ class AssetsConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class FlowDataConfig:
+    """Data-pipeline configuration for the flow fast-path.
+
+    K / Δ / vlm_delay_max / flow scale / clamp are read from `model.flow` (single source of truth).
+    """
+
+    enabled: bool = True
+    mode: Literal["cache", "online"] = "cache"
+    flow_cache_dir: str | None = None
+    sea_raft_ckpt: str | None = None
+    sea_raft_device: str = "cpu"
+
+
+@dataclasses.dataclass(frozen=True)
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
@@ -89,6 +103,9 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+
+    # Flow fast-path data configuration (flowpi). None disables the flow data pipeline.
+    flow: FlowDataConfig | None = None
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -236,6 +253,8 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
     # the space used by the pi internal runtime which was used to train the base model. People who
     # use standard Aloha data should set this to true.
     adapt_to_pi: bool = True
+    # Flow fast-path configuration (flowpi). `None` keeps the data pipeline identical to the baseline.
+    flow: FlowDataConfig | None = None
 
     # Repack transforms.
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
@@ -269,13 +288,76 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
 
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
 
+        repack_transforms = self.repack_transforms
+        flow_config: FlowDataConfig | None = None
+        if self.flow is not None and self.flow.enabled:
+            model_flow = getattr(model_config, "flow", None)
+            if model_flow is None or not model_flow.enabled:
+                raise ValueError("--data.flow.enabled requires the model config to have flow enabled (model.flow).")
+            flow_config = self.flow
+            cam_keys = self._repack_image_keys(repack_transforms)
+            frame_offsets = _transforms.compute_image_frame_offsets(
+                model_flow.num_flow_steps, model_flow.flow_stride_frames, model_flow.vlm_delay_max
+            )
+            if self.flow.mode == "online":
+                from openpi.training.sea_raft import SeaRaftFlowExtractor  # noqa: PLC0415
+
+                extractor = SeaRaftFlowExtractor(
+                    ckpt_path=self.flow.sea_raft_ckpt or None,
+                    variant="M",
+                    device=self.flow.sea_raft_device,
+                )
+                flow_transform: _transforms.DataTransformFn = _transforms.ComputeFlow(
+                    extractor,
+                    cam_keys,
+                    num_flow_steps=model_flow.num_flow_steps,
+                    flow_stride_frames=model_flow.flow_stride_frames,
+                    flow_scale=model_flow.flow_scale,
+                    flow_clamp=model_flow.flow_clamp,
+                    frame_offsets=frame_offsets,
+                )
+            else:
+                if self.flow.flow_cache_dir is None:
+                    raise ValueError("--data.flow.mode=cache requires --data.flow.flow-cache-dir.")
+                flow_transform = _transforms.LoadFlowCache(
+                    self.flow.flow_cache_dir,
+                    cam_keys,
+                    num_flow_steps=model_flow.num_flow_steps,
+                    flow_stride_frames=model_flow.flow_stride_frames,
+                    flow_image_size=model_flow.flow_image_size,
+                    flow_scale=model_flow.flow_scale,
+                    flow_clamp=model_flow.flow_clamp,
+                )
+            delay_transform = _transforms.DelaySlowImage(
+                model_flow.vlm_delay_max, frame_offsets, seed=0
+            )
+            data_transforms = _transforms.Group(
+                inputs=[flow_transform, delay_transform, *data_transforms.inputs],
+                outputs=data_transforms.outputs,
+            )
+            # The flow transforms need episode/frame indices to address the cache and validity.
+            repack_transforms = repack_transforms.push(
+                inputs=[_transforms.RepackTransform({"episode_index": "episode_index", "frame_index": "frame_index"})],
+            )
+
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
-            repack_transforms=self.repack_transforms,
+            repack_transforms=repack_transforms,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys,
+            flow=flow_config,
         )
+
+    @staticmethod
+    def _repack_image_keys(repack_transforms: _transforms.Group) -> tuple[str, ...]:
+        """Extracts the camera keys (post-repack names) from the repack transform structure."""
+        for transform in repack_transforms.inputs:
+            if isinstance(transform, _transforms.RepackTransform):
+                images = transform.structure.get("images")
+                if isinstance(images, dict):
+                    return tuple(images.keys())
+        raise ValueError("Could not find image keys in repack transforms.")
 
 
 @dataclasses.dataclass(frozen=True)

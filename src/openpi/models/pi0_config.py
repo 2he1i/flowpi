@@ -16,6 +16,40 @@ if TYPE_CHECKING:
 
 
 @dataclasses.dataclass(frozen=True)
+class FlowConfig:
+    """Configuration for the flowpi flow fast-path, πR² streaming, and slow-channel delay.
+
+    When `Pi0Config.flow is None`, the model graph is identical to the baseline π0.5.
+    """
+
+    enabled: bool = True
+    # Optical flow.
+    num_flow_steps: int = 2  # K
+    flow_stride_frames: int = 3  # Δ (dataset frames; Δt = Δ/fps)
+    flow_scale: float = 4.0
+    flow_clamp: float = 8.0
+    flow_image_size: tuple[int, int] = (480, 640)
+    tokenizer_channels: tuple[int, ...] = (32, 64, 128)
+    tokenizer_mlp_hidden: int = 512
+    # Cross-attention.
+    num_cross_heads: int = 8
+    cross_head_dim: int = 128
+    injection_layers: tuple[int, ...] | None = None  # None => (7, 12, 16)
+    # πR².
+    d_max: int = 5  # must be < action_horizon / 2
+    p_standard: float = 0.2
+    tau_jitter: float = 0.01
+    # Slow channel delay.
+    vlm_delay_max: int = 10
+
+    def __post_init__(self):
+        if self.injection_layers is None:
+            object.__setattr__(self, "injection_layers", (7, 12, 16))
+        if self.d_max <= 0:
+            raise ValueError(f"d_max must be positive, got {self.d_max}")
+
+
+@dataclasses.dataclass(frozen=True)
 class Pi0Config(_model.BaseModelConfig):
     dtype: str = "bfloat16"
     paligemma_variant: _gemma.Variant = "gemma_2b"

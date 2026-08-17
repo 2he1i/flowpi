@@ -75,6 +75,24 @@ class AlohaInputs(transforms.DataTransformFn):
             "state": data["state"],
         }
 
+        # flowpi: pass through the flow fast-path fields, remapping camera names like the images.
+        if "flow" in data:
+            flow_mapping = {
+                "base_0_rgb": "cam_high",
+                "left_wrist_0_rgb": "cam_left_wrist",
+                "right_wrist_0_rgb": "cam_right_wrist",
+            }
+            inputs["flow"] = {}
+            inputs["flow_masks"] = {}
+            for dest, source in flow_mapping.items():
+                if source in data["flow"]:
+                    inputs["flow"][dest] = data["flow"][source]
+                    inputs["flow_masks"][dest] = data["flow_masks"][source]
+
+        for key in ("vlm_delay", "episode_index", "frame_index"):
+            if key in data:
+                inputs[key] = data[key]
+
         # Actions are only available during training.
         if "actions" in data:
             actions = np.asarray(data["actions"])

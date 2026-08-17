@@ -1,0 +1,140 @@
+{
+    "codebase_version": "v3.0",
+    "robot_type": "aloha",
+    "total_episodes": 1,
+    "total_frames": 424,
+    "total_tasks": 1,
+    "chunks_size": 1000,
+    "data_files_size_in_mb": 100,
+    "video_files_size_in_mb": 500,
+    "fps": 50,
+    "splits": {
+        "train": "0:1"
+    },
+    "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+    "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+    "features": {
+        "observation.state": {
+            "dtype": "float32",
+            "shape": [
+                14
+            ],
+            "names": [
+                [
+                    "left_waist",
+                    "left_shoulder",
+                    "left_elbow",
+                    "left_forearm_roll",
+                    "left_wrist_angle",
+                    "left_wrist_rotate",
+                    "left_gripper",
+                    "right_waist",
+                    "right_shoulder",
+                    "right_elbow",
+                    "right_forearm_roll",
+                    "right_wrist_angle",
+                    "right_wrist_rotate",
+                    "right_gripper"
+                ]
+            ]
+        },
+        "action": {
+            "dtype": "float32",
+            "shape": [
+                14
+            ],
+            "names": [
+                [
+                    "left_waist",
+                    "left_shoulder",
+                    "left_elbow",
+                    "left_forearm_roll",
+                    "left_wrist_angle",
+                    "left_wrist_rotate",
+                    "left_gripper",
+                    "right_waist",
+                    "right_shoulder",
+                    "right_elbow",
+                    "right_forearm_roll",
+                    "right_wrist_angle",
+                    "right_wrist_rotate",
+                    "right_gripper"
+                ]
+            ]
+        },
+        "observation.images.cam_high": {
+            "dtype": "image",
+            "shape": [
+                3,
+                480,
+                640
+            ],
+            "names": [
+                "channels",
+                "height",
+                "width"
+            ]
+        },
+        "observation.images.cam_left_wrist": {
+            "dtype": "image",
+            "shape": [
+                3,
+                480,
+                640
+            ],
+            "names": [
+                "channels",
+                "height",
+                "width"
+            ]
+        },
+        "observation.images.cam_right_wrist": {
+            "dtype": "image",
+            "shape": [
+                3,
+                480,
+                640
+            ],
+            "names": [
+                "channels",
+                "height",
+                "width"
+            ]
+        },
+        "timestamp": {
+            "dtype": "float32",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "frame_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "episode_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        },
+        "task_index": {
+            "dtype": "int64",
+            "shape": [
+                1
+            ],
+            "names": null
+        }
+    }
+}

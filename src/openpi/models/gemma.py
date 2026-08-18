@@ -520,10 +520,9 @@ class Module(nn.Module):
             flow_slot = self._make_flow_slot()
             flow_params = self._make_flow_params()
             if flow is None:
-                # No flow input: use a single zero token with a valid mask. At initialization
-                # (gate=0) this is an exact no-op; afterwards it encodes "no motion".
-                flow = jnp.zeros((embedded[0].shape[0], 1, self.configs[1].width), dtype=embedded[0].dtype)
-                flow_mask = jnp.ones((embedded[0].shape[0], 1), dtype=jnp.bool_)
+                batch_size = next(e.shape[0] for e in embedded if e is not None)
+                flow = jnp.zeros((batch_size, 1, self.configs[1].width), dtype=jnp.dtype(self.embed_dtype) if isinstance(self.embed_dtype, str) else self.embed_dtype)
+                flow_mask = jnp.ones((batch_size, 1), dtype=jnp.bool_)
         else:
             flow_slot = jnp.full((self.configs[0].depth,), -1, dtype=jnp.int32)
             flow_params = None

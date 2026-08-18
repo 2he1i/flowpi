@@ -302,6 +302,8 @@ def _flow_cross_attn(q_hidden, flow, flow_mask, flow_params, slot, *, head_dim):
     big_neg = -2.3819763e38  # See gemma/modules.py
     logits = jnp.where(flow_mask[:, None, None, :], logits, big_neg)  # mask over k tokens
     probs = jax.nn.softmax(logits, axis=-1).astype(dtype)
+    has_valid_flow = jnp.any(flow_mask, axis=-1)[:, None, None, None]
+    probs = jnp.where(has_valid_flow, probs, jnp.zeros_like(probs))
     out = jnp.einsum("bnsf,bfnh->bsnh", probs, v)  # [b, s, n, h]
     return jnp.einsum("bsnh,nhd->bsd", out, flow_params["flow_out"][slot])  # [b, s, D]
 

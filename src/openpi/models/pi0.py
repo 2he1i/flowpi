@@ -302,9 +302,10 @@ class Pi0(_model.BaseModel):
             # scalar-time FM samples (p_standard), vectorized with per-row masks.
             cfg = self.flow_config
             is_pir2 = jax.random.bernoulli(mix_rng, p=1.0 - cfg.p_standard, shape=batch_shape)  # [B]
+            d_rng, jitter_rng, std_rng = jax.random.split(time_rng, 3)
 
             # Staircase branch.
-            d = jax.random.randint(time_rng, batch_shape, minval=1, maxval=cfg.d_max + 1)  # [B]
+            d = jax.random.randint(d_rng, batch_shape, minval=1, maxval=cfg.d_max + 1)  # [B]
             pos = jnp.arange(horizon)
             tau_stair = jnp.where(
                 pos[None, :] < d[:, None],
@@ -314,12 +315,14 @@ class Pi0(_model.BaseModel):
                 ),
             )  # [B, H]
             # τ jitter on the middle segment only (endpoints stay exact).
-            jitter = jax.random.uniform(time_rng, actions.shape[:-1], minval=-cfg.tau_jitter, maxval=cfg.tau_jitter)
+            jitter = jax.random.uniform(
+                jitter_rng, actions.shape[:-1], minval=-cfg.tau_jitter, maxval=cfg.tau_jitter
+            )
             mid = (tau_stair > 0) & (tau_stair < 1)
             tau_stair = jnp.where(mid, jnp.clip(tau_stair + jitter, 0.0, 1.0), tau_stair)
 
             # Standard branch: t ~ Beta(1.5, 1) shared across positions.
-            t_std = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001  # [B]
+            t_std = jax.random.beta(std_rng, 1.5, 1, batch_shape) * 0.999 + 0.001  # [B]
             tau_std = einops.repeat(t_std, "b -> b h", h=horizon)
 
             tau = jnp.where(is_pir2[:, None], tau_stair, tau_std)  # [B, H]
@@ -369,10 +372,9 @@ class Pi0(_model.BaseModel):
 
         sq = jnp.square(v_t - u_t)
         if self.flow_config is not None and self.pi05:
-            # Masked mean over positions (per-position weights); unbatched dims keep [B, H] shape.
-            return jnp.sum(sq * loss_mask[..., None], axis=-1) / jnp.maximum(
-                jnp.sum(loss_mask, axis=-1, keepdims=True) * sq.shape[-1], 1.0
-            )
+            # Renormalize valid positions so the outer mean matches the baseline π0.5 loss scale.
+            valid_count = jnp.maximum(jnp.sum(loss_mask, axis=-1, keepdims=True), 1.0)
+            return jnp.mean(sq, axis=-1) * loss_mask * (horizon / valid_count)
         return jnp.mean(sq, axis=-1)
 
     @override

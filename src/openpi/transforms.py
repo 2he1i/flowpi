@@ -401,7 +401,7 @@ class LoadFlowCache(DataTransformFn):
         self._mmaps: dict[int, tuple[dict[str, np.ndarray], np.ndarray]] = {}
 
     def _validate_meta(self) -> None:
-        import json  # noqa: PLC0415
+        import json
 
         meta_path = self.flow_cache_dir / "meta.json"
         if not meta_path.exists():

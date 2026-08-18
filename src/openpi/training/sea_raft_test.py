@@ -4,7 +4,7 @@ import pytest
 pytestmark = pytest.mark.slow
 
 
-@pytest.fixture()
+@pytest.fixture
 def extractor():
     from openpi.training.sea_raft import SeaRaftFlowExtractor
 

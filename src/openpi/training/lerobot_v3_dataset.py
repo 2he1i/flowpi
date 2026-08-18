@@ -15,16 +15,16 @@ Images are returned as `uint8` numpy arrays in `[channel, height, width]` layout
 the upstream LeRobot dataset returns and that openpi's transforms expect.
 """
 
+from collections.abc import Sequence
 import dataclasses
 import io
 import json
 import pathlib
-from collections.abc import Sequence
 
 import numpy as np
+from PIL import Image
 import pyarrow as pa
 import pyarrow.parquet as pq
-from PIL import Image
 
 
 @dataclasses.dataclass(frozen=True)

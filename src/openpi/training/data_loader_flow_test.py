@@ -1,6 +1,5 @@
 """flowpi data pipeline tests: online flow, cache roundtrip, slow-channel delay."""
 
-import dataclasses
 import pathlib
 
 import numpy as np
@@ -99,7 +98,8 @@ def test_online_flow_sample():
 
 def test_cache_roundtrip_matches_online(tmp_path):
     # Precompute the cache for the single episode using the script's worker logic.
-    from scripts.precompute_flow_cache import _episode_entries, _process_episode  # noqa: PLC0415
+    from scripts.precompute_flow_cache import _episode_entries
+    from scripts.precompute_flow_cache import _process_episode
 
     entries = _episode_entries(_TEST_DATA)
     cache_dir = str(tmp_path / "flow_cache")
@@ -118,7 +118,7 @@ def test_cache_roundtrip_matches_online(tmp_path):
     _process_episode(task)
 
     # Write the meta file that LoadFlowCache validates.
-    import json  # noqa: PLC0415
+    import json
 
     with open(pathlib.Path(cache_dir) / "meta.json", "w") as f:
         json.dump({"num_flow_steps": 2, "flow_stride_frames": 3, "image_size": [480, 640]}, f)

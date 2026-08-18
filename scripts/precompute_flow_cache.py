@@ -15,18 +15,16 @@ Usage:
 """
 
 import argparse
-import dataclasses
+from concurrent.futures import ProcessPoolExecutor
 import io
 import json
 import pathlib
-import sys
-from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
-import pyarrow.parquet as pq
-import tyro
 from PIL import Image
+import pyarrow.parquet as pq
 from tqdm import tqdm
+import tyro
 
 
 def _parse_args():
@@ -35,7 +33,7 @@ def _parse_args():
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true")
     known, remaining = parser.parse_known_args()
-    import openpi.training.config as _config  # noqa: PLC0415
+    import openpi.training.config as _config
 
     configs = {k: (k, v) for k, v in _config._CONFIGS_DICT.items()}
     train_config = tyro.extras.overridable_config_cli(configs, args=remaining, prog="precompute_flow_cache")
@@ -88,7 +86,7 @@ def _cache_name(cam_key: str) -> str:
 
 def _process_episode(task: dict) -> dict:
     """Worker: computes and saves the flow cache for one episode."""
-    from openpi.training.sea_raft import SeaRaftFlowExtractor  # noqa: PLC0415
+    from openpi.training.sea_raft import SeaRaftFlowExtractor
 
     extractor = SeaRaftFlowExtractor(
         ckpt_path=task["sea_raft_ckpt"] or None, variant="M", device=task["sea_raft_device"]

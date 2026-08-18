@@ -84,12 +84,12 @@ def _run_runtime_test(sea_raft_device="cpu"):
         tick_actions.append(acts)
         # _prefix_age counts ticks since last refresh; resets on refresh.
         expected_age = i - ((i - 1) // 5) * 5
-        assert runtime._prefix_age == expected_age
+        assert runtime._prefix_age == expected_age  # noqa: SLF001
 
         # Refresh every 5 ticks.
         if i % 5 == 0:
             runtime.refresh_prefix(observations[i])
-            assert runtime._prefix_age == 0
+            assert runtime._prefix_age == 0  # noqa: SLF001
 
     # Post-refresh age check.
     assert len(tick_actions) == n_frames - 1

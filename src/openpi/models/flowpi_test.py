@@ -4,14 +4,12 @@ Covers: zero-gate equivalence, init gradient invariants, parameter budget, stair
 construction/self-similarity, per-position RMSNorm, and the streaming runtime.
 """
 
-import dataclasses
 
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import pytest
 
 import openpi.models.pi0 as _pi0
 import openpi.models.pi0_config as _pi0_config
@@ -251,7 +249,7 @@ def test_staircase_self_similarity():
 def test_per_position_rmsnorm_shapes():
     """adaRMS RMSNorm accepts cond [b, d] (legacy) and [b, s, d] (per-position); the [b, d] path
     broadcasts over positions exactly as before (checkpoint compatibility)."""
-    import openpi.models.gemma as _gemma  # noqa: PLC0415
+    import openpi.models.gemma as _gemma
 
     b, s, d = 2, 5, 64
     x = jax.random.normal(jax.random.key(0), (b, s, d))

@@ -325,7 +325,7 @@ class Block(nn.Module):
     flow_enabled: bool = False
 
     @nn.compact
-    def __call__(  # noqa: PLR0913
+    def __call__(
         self,
         xs,
         kv_cache,

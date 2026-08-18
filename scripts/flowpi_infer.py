@@ -7,20 +7,15 @@ Usage:
 """
 
 import argparse
-import dataclasses
 import pathlib
 import time
 
-import jax
-import jax.numpy as jnp
 import numpy as np
 
 import openpi.models.model as _model
-import openpi.models.pi0_config as pi0_config
 import openpi.policies.flowpi_runtime as flowpi_runtime
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
-import openpi.transforms as _transforms
 
 
 def main():
@@ -43,7 +38,9 @@ def main():
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     # Build a minimal dataset — one sample per frame without action deltas.
     dataset = _data_loader.create_torch_dataset(
-        data_config, action_horizon=1, model_config=train_config.model,
+        data_config,
+        action_horizon=1,
+        model_config=train_config.model,
     )
     frame_count = len(dataset)
     if args.max_frames is not None:
@@ -112,4 +109,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()", "filePath": "/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/zheli/DOMINO/policy/flowPi/scripts/flowpi_infer.py"}
+    main()

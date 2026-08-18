@@ -185,7 +185,7 @@ def _get_lerobot_dataset(repo_id: str):
         with open(local_path / "meta" / "info.json") as f:
             info = json.load(f)
         if str(info.get("codebase_version", "")).startswith("v3"):
-            import openpi.training.lerobot_v3_dataset as lerobot_v3_dataset  # noqa: PLC0415
+            import openpi.training.lerobot_v3_dataset as lerobot_v3_dataset
 
             dataset = lerobot_v3_dataset.LeRobotV3ParquetDataset(local_path)
         else:
@@ -220,7 +220,7 @@ def make_lerobot_dataset(repo_id: str, delta_timestamps: dict[str, list[float]])
         with open(local_path / "meta" / "info.json") as f:
             info = json.load(f)
         if str(info.get("codebase_version", "")).startswith("v3"):
-            import openpi.training.lerobot_v3_dataset as lerobot_v3_dataset  # noqa: PLC0415
+            import openpi.training.lerobot_v3_dataset as lerobot_v3_dataset
 
             return lerobot_v3_dataset.LeRobotV3ParquetDataset(local_path, delta_timestamps=delta_timestamps)
         return lerobot_dataset.LeRobotDataset(repo_id, root=str(local_path), delta_timestamps=delta_timestamps)

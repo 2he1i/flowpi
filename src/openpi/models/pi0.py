@@ -8,8 +8,8 @@ import jax
 import jax.numpy as jnp
 from typing_extensions import override
 
-from openpi.models import model as _model
 from openpi.models import flow_tokenizer as _flow_tokenizer
+from openpi.models import model as _model
 from openpi.models import pi0_config
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
@@ -286,7 +286,7 @@ class Pi0(_model.BaseModel):
         the flow fast-path is disabled or the observation carries no flow."""
         if self.flow_config is None or obs.flow is None:
             return None
-        return self.flow_tokenizer(obs.flow, obs.flow_masks or {k: None for k in obs.flow})
+        return self.flow_tokenizer(obs.flow, obs.flow_masks or dict.fromkeys(obs.flow))
 
     @override
     def compute_loss(

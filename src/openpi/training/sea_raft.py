@@ -26,7 +26,7 @@ _VARIANT_CONFIGS = {
 def _make_raft_args(dim: int, iters: int, radius: int, block_dims: list[int]):
     # SEA-RAFT's RAFT constructor mutates the args namespace (e.g. `args.corr_levels = 4`), so we
     # use a plain namespace instead of a frozen dataclass.
-    from types import SimpleNamespace  # noqa: PLC0415
+    from types import SimpleNamespace
 
     return SimpleNamespace(
         dim=dim,
@@ -50,7 +50,7 @@ def _import_raft():
     core_dir = str(_SEA_RAFT_CORE_DIR)
     if core_dir not in sys.path:
         sys.path.insert(0, core_dir)
-    from raft import RAFT  # noqa: PLC0415
+    from raft import RAFT
 
     return RAFT
 

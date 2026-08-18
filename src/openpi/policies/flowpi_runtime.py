@@ -1,8 +1,8 @@
 """FlowPi runtime: frame ring buffer, per-tick optical flow, background prefix refresh, and the πR² streaming loop."""
 
+from collections.abc import Sequence
 import dataclasses
 import threading
-from collections.abc import Sequence
 from typing import Any
 
 import jax
@@ -12,7 +12,8 @@ import numpy as np
 from openpi.models import model as _model
 from openpi.models import pi0 as _pi0
 from openpi.training.sea_raft import SeaRaftFlowExtractor
-from openpi.transforms import compute_image_frame_offsets, frame_offset_index, normalize_flow
+from openpi.transforms import compute_image_frame_offsets
+from openpi.transforms import normalize_flow
 
 
 class _FrameRingBuffer:
@@ -30,9 +31,7 @@ class _FrameRingBuffer:
         self.cam_keys = tuple(cam_keys)
         self.capacity = capacity
         h, w = first_frames[next(iter(cam_keys))].shape[-2:]
-        self.buffer: dict[str, np.ndarray] = {
-            cam: np.zeros((capacity, 3, h, w), dtype=np.uint8) for cam in cam_keys
-        }
+        self.buffer: dict[str, np.ndarray] = {cam: np.zeros((capacity, 3, h, w), dtype=np.uint8) for cam in cam_keys}
         for cam in cam_keys:
             self.buffer[cam][0] = first_frames[cam]
         self.base_index = 0  # dataset-frame-index of self.buffer[:, 0]
@@ -106,9 +105,7 @@ class FlowPiRuntime:
         k = flow_config.num_flow_steps
         stride = flow_config.flow_stride_frames
         self._ring_capacity = k * stride + 1
-        self._frame_offsets = compute_image_frame_offsets(
-            k, stride, flow_config.vlm_delay_max
-        )
+        self._frame_offsets = compute_image_frame_offsets(k, stride, flow_config.vlm_delay_max)
 
         # SEA-RAFT extractor (online flow).
         self._raft = SeaRaftFlowExtractor(
@@ -126,7 +123,7 @@ class FlowPiRuntime:
         self._streaming_state: _pi0.Pi0.StreamingState | None = None
         self._ring: _FrameRingBuffer | None = None
 
-        # Image resolution for flow (480×640 → 60×80 grid).
+        # Image resolution for flow (480x640 -> 60x80 grid).
         h, w = flow_config.flow_image_size
         self._flow_grid = (h // 8, w // 8)
 
@@ -140,9 +137,7 @@ class FlowPiRuntime:
         # HWC → CHW.
         first_chw = {cam: np.transpose(img, (2, 0, 1)) for cam, img in first_u8.items()}
         if self._ring is None:
-            self._ring = _FrameRingBuffer.create(
-                self._cam_keys, self._ring_capacity, first_chw
-            )
+            self._ring = _FrameRingBuffer.create(self._cam_keys, self._ring_capacity, first_chw)
         else:
             for cam in self._cam_keys:
                 self._ring.push(cam, first_chw[cam])
@@ -168,12 +163,10 @@ class FlowPiRuntime:
             if self._ring.base_index + offset >= 0:
                 lag = self._ring.get(offset)
                 valid_lags.append(True)
-                for cam in self._cam_keys:
-                    prev_frames.append(lag[cam][None])  # [1, 3, H, W]
+                prev_frames.extend(lag[cam][None] for cam in self._cam_keys)
             else:
                 valid_lags.append(False)
-                for cam in self._cam_keys:
-                    prev_frames.append(np.zeros_like(curr_frame[cam][None]))
+                prev_frames.extend(np.zeros_like(curr_frame[cam][None]) for cam in self._cam_keys)
 
         curr_stacked = np.concatenate(
             [curr_frame[cam][None] for _ in range(k) for cam in self._cam_keys],
@@ -191,9 +184,7 @@ class FlowPiRuntime:
             for lag_idx, valid in enumerate(valid_lags):
                 if not valid:
                     raw[lag_idx] = 0.0
-            result[cam] = normalize_flow(
-                raw, self.flow_config.flow_scale, self.flow_config.flow_clamp
-            )
+            result[cam] = normalize_flow(raw, self.flow_config.flow_scale, self.flow_config.flow_clamp)
         return result
 
     # ---- public API ------------------------------------------------------------
@@ -221,27 +212,21 @@ class FlowPiRuntime:
         self._ingest_frame(observation)
         flow_data = self._compute_flow()
 
-        with self._slow_lock:
-            kv_cache = self._kv_cache
-            prefix_mask = self._prefix_mask
-
         # Attach fresh flow and vlm_delay to the observation.
         obs_with_flow = dataclasses.replace(
             observation,
-            flow={
-                cam: jnp.asarray(arr)[None, ...] for cam, arr in flow_data.items()
-            },
-            flow_masks={
-                cam: jnp.ones((1, self.flow_config.num_flow_steps), dtype=bool)
-                for cam in self._cam_keys
-            },
+            flow={cam: jnp.asarray(arr)[None, ...] for cam, arr in flow_data.items()},
+            flow_masks={cam: jnp.ones((1, self.flow_config.num_flow_steps), dtype=bool) for cam in self._cam_keys},
             vlm_delay=jnp.asarray([self._prefix_age], dtype=jnp.int32),
         )
 
         # One NFE.
         rng = jax.random.fold_in(jax.random.key(self._prefix_age), self._prefix_age)
         emit, self._streaming_state = self.model.denoise_step(
-            self._streaming_state, obs_with_flow, rng, d=self._d,
+            self._streaming_state,
+            obs_with_flow,
+            rng,
+            d=self._d,
         )
 
         self._prefix_age += 1
@@ -253,7 +238,7 @@ class FlowPiRuntime:
         This should be called from a background thread (e.g. every N ticks).
         """
         observation = _model.preprocess_observation(None, observation, train=False)
-        kv_cache, prefix_mask = self.model._prefix_forward(observation)
+        kv_cache, prefix_mask = self.model._prefix_forward(observation)  # noqa: SLF001
         with self._slow_lock:
             self._kv_cache = kv_cache
             self._prefix_mask = prefix_mask

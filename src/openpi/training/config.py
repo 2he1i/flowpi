@@ -300,7 +300,7 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
                 model_flow.num_flow_steps, model_flow.flow_stride_frames, model_flow.vlm_delay_max
             )
             if self.flow.mode == "online":
-                from openpi.training.sea_raft import SeaRaftFlowExtractor  # noqa: PLC0415
+                from openpi.training.sea_raft import SeaRaftFlowExtractor
 
                 extractor = SeaRaftFlowExtractor(
                     ckpt_path=self.flow.sea_raft_ckpt or None,

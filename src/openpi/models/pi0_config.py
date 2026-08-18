@@ -85,9 +85,9 @@ class Pi0Config(_model.BaseModelConfig):
                 "max-autotune-no-cudagraphs",
             ]
         if self.flow is not None and self.flow.enabled:
-            assert self.flow.d_max < self.action_horizon / 2, (
-                f"flow.d_max ({self.flow.d_max}) must be < action_horizon/2 ({self.action_horizon / 2})"
-            )
+            assert (
+                self.flow.d_max < self.action_horizon / 2
+            ), f"flow.d_max ({self.flow.d_max}) must be < action_horizon/2 ({self.action_horizon / 2})"
 
     @property
     @override

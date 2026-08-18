@@ -18,6 +18,15 @@ import openpi.models.pi0 as _pi0
 # Dataset camera order (must match model.IMAGE_KEYS).
 _CAMERA_ORDER = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
 
+# Module-level initializers (shared, stable objects). Constructing these fresh inside `__init__`
+# would create new closure objects on every model instantiation, which leaks into the nnx graphdef
+# static fields and breaks pjit out_shardings / output structural comparison.
+_LECUN = nnx.initializers.lecun_normal()
+
+
+def _normal_small(rng, shape, dtype):
+    return jnp.asarray(0.02 * jax.random.normal(rng, shape), dtype)
+
 
 class FlowTokenizer(nnx.Module):
     def __init__(
@@ -44,7 +53,7 @@ class FlowTokenizer(nnx.Module):
                     kernel_size=(3, 3),
                     strides=(2, 2),
                     padding="SAME",
-                    kernel_init=nnx.initializers.lecun_normal(),
+                    kernel_init=_LECUN,
                     rngs=rngs,
                 )
             )
@@ -63,8 +72,8 @@ class FlowTokenizer(nnx.Module):
 
         hidden = channels[-1]
         self.norm = nnx.LayerNorm(num_features=hidden, rngs=rngs)
-        self.mlp_in = nnx.Linear(hidden, mlp_hidden, kernel_init=nnx.initializers.lecun_normal(), rngs=rngs)
-        self.mlp_out = nnx.Linear(mlp_hidden, width, kernel_init=nnx.initializers.lecun_normal(), rngs=rngs)
+        self.mlp_in = nnx.Linear(hidden, mlp_hidden, kernel_init=_LECUN, rngs=rngs)
+        self.mlp_out = nnx.Linear(mlp_hidden, width, kernel_init=_LECUN, rngs=rngs)
 
         # Fixed 2D sincos positional embedding over the reduced grid (row + col, 64 dims each).
         # Recomputed on the fly (cheap sincos tables) instead of being stored as a module
@@ -78,13 +87,13 @@ class FlowTokenizer(nnx.Module):
         self.lag_emb = nnx.Embed(
             num_embeddings=num_flow_steps,
             features=hidden,
-            embedding_init=lambda rng, shape, dtype: jnp.asarray(0.02 * jax.random.normal(rng, shape), dtype),
+            embedding_init=_normal_small,
             rngs=rngs,
         )
         self.cam_emb = nnx.Embed(
             num_embeddings=len(_CAMERA_ORDER),
             features=hidden,
-            embedding_init=lambda rng, shape, dtype: jnp.asarray(0.02 * jax.random.normal(rng, shape), dtype),
+            embedding_init=_normal_small,
             rngs=rngs,
         )
 

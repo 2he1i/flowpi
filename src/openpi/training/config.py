@@ -1054,6 +1054,77 @@ _CONFIGS = [
         exp_name="debug_pi05",
         wandb_enabled=False,
     ),
+    #
+    # flowpi configs.
+    #
+    TrainConfig(
+        # CPU/GPU smoke test: dummy variants (depth 4, injection layers (1,2), d_max=2) + fake data.
+        name="debug_flowpi",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            discrete_state_input=False,
+            paligemma_variant="dummy",
+            action_expert_variant="dummy",
+            flow=pi0_config.FlowConfig(d_max=2, injection_layers=(1, 2), vlm_delay_max=3),
+        ),
+        data=FakeDataConfig(),
+        batch_size=2,
+        num_train_steps=10,
+        save_interval=5,
+        overwrite=True,
+        exp_name="debug_flowpi",
+        wandb_enabled=False,
+        ema_decay=None,  # No EMA for the smoke test; simplifies the optimization loop.
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="dummy",
+            action_expert_variant="dummy",
+            flow=pi0_config.FlowConfig(d_max=2, injection_layers=(1, 2), vlm_delay_max=3),
+        ).get_freeze_filter(),
+    ),
+    TrainConfig(
+        # Full flowpi fine-tuning on the aloha dataset. Replace placeholder paths before running:
+        # repo_id (local LeRobot v3 dataset dir or HF repo), flow cache dir, SEA-RAFT checkpoint.
+        name="flowpi_aloha",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            discrete_state_input=False,
+            flow=pi0_config.FlowConfig(),
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="<your-dataset>/adjust_bottle",
+            default_prompt="Adjust the bottle on the table",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+            flow=FlowDataConfig(
+                mode="cache",
+                flow_cache_dir="<your-flow-cache-dir>",
+                sea_raft_ckpt="<your-sea-raft-ckpt>",
+                sea_raft_device="cuda",
+            ),
+        ),
+        weight_loader=weight_loaders.FlowPiWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, discrete_state_input=False, flow=pi0_config.FlowConfig()).get_freeze_filter(),
+        num_train_steps=20_000,
+        batch_size=32,
+    ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),

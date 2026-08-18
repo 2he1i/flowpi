@@ -55,6 +55,22 @@ class CheckpointWeightLoader(WeightLoader):
 
 
 @dataclasses.dataclass(frozen=True)
+class FlowPiWeightLoader(WeightLoader):
+    """Loads weights from a pi05_base-style checkpoint for flowpi fine-tuning.
+
+    Like `CheckpointWeightLoader`, but additionally keeps all flowpi-specific parameters
+    (tokenizer / cross-attention slots / gates / delay embedding / state projection) at their new
+    initialization via `missing_regex=r".*(lora|flow).*"`.
+    """
+
+    params_path: str
+
+    def load(self, params: at.Params) -> at.Params:
+        loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+        return _merge_params(loaded_params, params, missing_regex=r".*(lora|flow).*")
+
+
+@dataclasses.dataclass(frozen=True)
 class PaliGemmaWeightLoader(WeightLoader):
     """Loads weights from the official PaliGemma checkpoint.
 

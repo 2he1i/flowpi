@@ -21,6 +21,36 @@ def _dummy_flow_config():
     )
 
 
+def test_frame_ring_buffer_tracks_latest_and_history():
+    """The cursor must always identify the latest valid synchronized frame set."""
+    cams = ("cam0", "cam1")
+
+    def frame(value: int) -> np.ndarray:
+        return np.full((3, 2, 2), value, dtype=np.uint8)
+
+    ring = flowpi_runtime._FrameRingBuffer.create(  # noqa: SLF001
+        cams,
+        capacity=3,
+        first_frames={cam: frame(0) for cam in cams},
+    )
+    assert all(np.all(x == 0) for x in ring.get(0).values())
+
+    for value in (1, 2, 3, 4):
+        ring.advance()
+        for cam in cams:
+            ring.push(cam, frame(value))
+
+        assert all(np.all(x == value) for x in ring.get(0).values())
+        assert all(np.all(x == value - 1) for x in ring.get(-1).values())
+        if value >= 2:
+            assert all(np.all(x == value - 2) for x in ring.get(-2).values())
+
+    with pytest.raises(IndexError):
+        ring.get(-3)
+    with pytest.raises(IndexError):
+        ring.get(1)
+
+
 def _run_runtime_test(sea_raft_device="cpu"):
     """Shared test body — parameterised by device."""
     model = pi0_config.Pi0Config(

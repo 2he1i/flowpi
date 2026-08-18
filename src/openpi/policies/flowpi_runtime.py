@@ -19,7 +19,8 @@ from openpi.transforms import normalize_flow
 class _FrameRingBuffer:
     """Sliding window of decoded camera frames in CHW uint8 layout.
 
-    ``buffer[t]`` holds the frame whose dataset-frame-index is ``base_index + t``.
+    ``current`` always points to the latest valid frame. ``base_index`` is the
+    dataset-frame-index of that latest frame.
     """
 
     def __init__(
@@ -34,14 +35,15 @@ class _FrameRingBuffer:
         self.buffer: dict[str, np.ndarray] = {cam: np.zeros((capacity, 3, h, w), dtype=np.uint8) for cam in cam_keys}
         for cam in cam_keys:
             self.buffer[cam][0] = first_frames[cam]
-        self.base_index = 0  # dataset-frame-index of self.buffer[:, 0]
-        self.current = 0  # write cursor; buffer[:, current] is the latest frame
+        self.base_index = 0  # dataset-frame-index of the latest frame
+        self.current = 0  # buffer[:, current] is the latest frame
 
     def push(self, cam_key: str, frame_chw: np.ndarray) -> None:
         """Write one camera frame at the current cursor position."""
         self.buffer[cam_key][self.current] = frame_chw
 
     def advance(self) -> int:
+        """Advance the cursor to the slot for the next frame."""
         old = self.current
         self.current = (self.current + 1) % self.capacity
         self.base_index += 1
@@ -55,6 +57,8 @@ class _FrameRingBuffer:
         """
         if self.base_index + offset < 0:
             raise IndexError(f"Frame at offset {offset} is before the episode start.")
+        if offset > 0 or -offset >= self.capacity:
+            raise IndexError(f"Frame at offset {offset} is outside the ring buffer window.")
         idx = (self.current + offset) % self.capacity
         return {cam: arr[idx] for cam, arr in self.buffer.items()}
 
@@ -139,15 +143,17 @@ class FlowPiRuntime:
         if self._ring is None:
             self._ring = _FrameRingBuffer.create(self._cam_keys, self._ring_capacity, first_chw)
         else:
+            # ``current`` denotes the latest valid frame, so move to the next
+            # slot before writing the new synchronized camera frame set.
+            self._ring.advance()
             for cam in self._cam_keys:
                 self._ring.push(cam, first_chw[cam])
-            self._ring.advance()
 
-    def _compute_flow(self) -> dict[str, np.ndarray]:
-        """Compute normalised per-lag optical flow from the ring buffer.
+    def _compute_flow(self) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+        """Compute normalised per-lag optical flow and validity masks.
 
         Lags that refer to frames before the episode start (first few ticks) are
-          filled with zero flow and the caller attaches a per-lag mask (True = valid).
+        filled with zero flow and marked invalid in the returned masks.
         """
         assert self._ring is not None
         k = self.flow_config.num_flow_steps
@@ -179,13 +185,14 @@ class FlowPiRuntime:
         flow = flow.reshape(k, n_cam, 2, h8, w8)
 
         result = {}
+        masks = {}
+        valid_mask = np.asarray(valid_lags, dtype=bool)
         for ci, cam in enumerate(self._cam_keys):
-            raw = flow[:, ci]  # [K, 2, h8, w8]
-            for lag_idx, valid in enumerate(valid_lags):
-                if not valid:
-                    raw[lag_idx] = 0.0
+            raw = flow[:, ci].copy()  # [K, 2, h8, w8]
+            raw[~valid_mask] = 0.0
             result[cam] = normalize_flow(raw, self.flow_config.flow_scale, self.flow_config.flow_clamp)
-        return result
+            masks[cam] = valid_mask.copy()
+        return result, masks
 
     # ---- public API ------------------------------------------------------------
 
@@ -210,13 +217,13 @@ class FlowPiRuntime:
         Returns the ``d`` emitted actions (shape ``[d, action_dim]``).
         """
         self._ingest_frame(observation)
-        flow_data = self._compute_flow()
+        flow_data, flow_masks = self._compute_flow()
 
-        # Attach fresh flow and vlm_delay to the observation.
+        # Attach fresh flow and per-lag validity to the observation.
         obs_with_flow = dataclasses.replace(
             observation,
             flow={cam: jnp.asarray(arr)[None, ...] for cam, arr in flow_data.items()},
-            flow_masks={cam: jnp.ones((1, self.flow_config.num_flow_steps), dtype=bool) for cam in self._cam_keys},
+            flow_masks={cam: jnp.asarray(mask)[None, ...] for cam, mask in flow_masks.items()},
             vlm_delay=jnp.asarray([self._prefix_age], dtype=jnp.int32),
         )
 

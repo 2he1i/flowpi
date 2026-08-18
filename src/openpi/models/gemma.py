@@ -58,11 +58,33 @@ Variant = Literal["dummy", "gemma_300m", "gemma_300m_lora", "gemma_2b", "gemma_2
 def get_config(variant: Variant) -> Config:
     """Returns config for specified gemma variant."""
     if variant == "dummy":
-        return Config(width=64, depth=4, mlp_dim=128, num_heads=8, num_kv_heads=1, head_dim=16)
+        return Config(
+            width=64,
+            depth=4,
+            mlp_dim=128,
+            num_heads=8,
+            num_kv_heads=1,
+            head_dim=16,
+        )
     if variant == "gemma_300m":
-        return Config(width=1024, depth=18, mlp_dim=4096, num_heads=8, num_kv_heads=1, head_dim=256)
+        # 311M params
+        return Config(
+            width=1024,
+            depth=18,
+            mlp_dim=4096,
+            num_heads=8,
+            num_kv_heads=1,
+            head_dim=256,
+        )
     if variant == "gemma_2b":
-        return Config(width=2048, depth=18, mlp_dim=16_384, num_heads=8, num_kv_heads=1, head_dim=256)
+        return Config(
+            width=2048,
+            depth=18,
+            mlp_dim=16_384,
+            num_heads=8,
+            num_kv_heads=1,
+            head_dim=256,
+        )
     if variant == "gemma_2b_lora":
         return Config(
             width=2048,
@@ -74,6 +96,7 @@ def get_config(variant: Variant) -> Config:
             lora_configs={"attn": lora.LoRAConfig(rank=16, alpha=16.0), "ffn": lora.LoRAConfig(rank=16, alpha=16.0)},
         )
     if variant == "gemma_300m_lora":
+        # 311M params
         return Config(
             width=1024,
             depth=18,
@@ -90,30 +113,40 @@ def get_config(variant: Variant) -> Config:
 class RMSNorm(nn.Module):
     @nn.compact
     def __call__(self, x, cond):
-        dtype = x.dtype
-        var = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)
-        normed_inputs = jnp.asarray(x * jnp.reciprocal(jnp.sqrt(var + 1e-06)))
+        dtype = x.dtype  # original dtype, could be half-precision
+        var = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)  # compute variance in float32
+        normed_inputs = jnp.asarray(x * jnp.reciprocal(jnp.sqrt(var + 1e-06)))  # compute normalization in float32
         if cond is None:
+            # regular RMSNorm
             scale = self.param("scale", nn.initializers.zeros_init(), (x.shape[-1]))
-            normed_inputs = normed_inputs * (1 + scale)
-            return normed_inputs.astype(dtype), None
+            normed_inputs = normed_inputs * (
+                1 + scale
+            )  # scale by learned parameter in float32 (matches Flax implementation)
+            return normed_inputs.astype(dtype), None  # return in original dtype
+
+        # adaptive RMSNorm. `cond` may be [b, d] (one modulation shared by all positions, legacy
+        # behavior) or [b, s, d] (per-position modulation, flowpi πR² path).
         modulation = nn.Dense(x.shape[-1] * 3, kernel_init=nn.initializers.zeros, dtype=dtype)(cond)
         if modulation.ndim == 2:
             scale, shift, gate = jnp.split(modulation[:, None, :], 3, axis=-1)
         else:
             scale, shift, gate = jnp.split(modulation, 3, axis=-1)
-        normed_inputs = normed_inputs * (1 + scale) + shift
+        normed_inputs = normed_inputs * (1 + scale) + shift  # scale and shift in float32
         return normed_inputs.astype(dtype), gate
 
 
 @at.typecheck
 class Embedder(nn.Module):
+    """Embedder module."""
+
     vocab_size: int
     embed_dim: int
 
     def setup(self):
         self.input_embedding_table = self.param(
-            "input_embedding", nn.initializers.normal(), (self.vocab_size, self.embed_dim)
+            "input_embedding",
+            nn.initializers.normal(),
+            (self.vocab_size, self.embed_dim),
         )
 
     def encode(self, x):
@@ -127,14 +160,19 @@ class Embedder(nn.Module):
 
 @at.typecheck
 class Attention(nn.Module):
+    """Attention module."""
+
     configs: Sequence[Config]
 
     @nn.compact
     def __call__(self, xs, positions, attn_mask, kv_cache):
+        # all experts must share the same head dim, num heads, and num kv heads for self-attention to work
         assert all(config.head_dim == self.configs[0].head_dim for config in self.configs)
         assert all(config.num_heads == self.configs[0].num_heads for config in self.configs)
         assert all(config.num_kv_heads == self.configs[0].num_kv_heads for config in self.configs)
-        dtype = next(x.dtype for x in xs if x is not None)
+
+        dtype = next(x.dtype for x in xs if x is not None)  # original dtype, could be half-precision
+
         qkvs = []
         for i, (x, config) in enumerate(zip(xs, self.configs, strict=True)):
             if x is None:
@@ -163,26 +201,39 @@ class Attention(nn.Module):
                 )
                 k, v = kv_einsum("BSD,2KDH->2BSKH", x)
                 qkvs.append((q, k, v))
+
         q, k, v = (jnp.concatenate(y, axis=1) for y in zip(*qkvs, strict=True))
+
         q = _apply_rope(q, positions=positions)
         q *= self.configs[0].head_dim ** -0.5
+
         k = _apply_rope(k, positions=positions)
+
+        # should still be half-precision here (if input was half-precision)
         assert q.dtype == k.dtype == v.dtype == dtype
+
         if kv_cache is not None:
             cache_k, cache_v = kv_cache
             k = jnp.concatenate([cache_k, k], axis=1)
             v = jnp.concatenate([cache_v, v], axis=1)
+
         q = einops.rearrange(q, "B T (K G) H -> B T K G H", K=self.configs[0].num_kv_heads)
         logits = jnp.einsum("BTKGH,BSKH->BKGTS", q, k, preferred_element_type=jnp.float32)
+
         if attn_mask.shape != (q.shape[0], 1, q.shape[1], k.shape[1]):
             raise ValueError(
                 f"Attention mask with shape {attn_mask.shape} but shapes for q and k are: {q.shape} and {k.shape}"
             )
-        big_neg = -2.3819763e38
+
+        # big_neg = jnp.finfo(logits.dtype).min
+        big_neg = -2.3819763e38  # See gemma/modules.py
         masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)
+
         probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
+
         encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
         encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
+
         out = []
         start = 0
         for i, (x, config) in enumerate(zip(xs, self.configs, strict=True)):
@@ -198,17 +249,20 @@ class Attention(nn.Module):
                 start = end
             else:
                 out.append(None)
+
         return out, (k, v)
 
 
 @at.typecheck
 class FeedForward(nn.Module):
+    """Feed forward module."""
+
     features: int
     hidden_dim: int
 
     @nn.compact
     def __call__(self, x):
-        dtype = x.dtype
+        dtype = x.dtype  # original dtype, could be half-precision
         w_gating = self.param(
             "gating_einsum",
             nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0,)),
@@ -216,10 +270,14 @@ class FeedForward(nn.Module):
         ).astype(dtype)
         ff_gate = jnp.dot(x, w_gating[0])
         gate_value = nn.gelu(ff_gate)
+
         ff1 = jnp.dot(x, w_gating[1])
         activations = gate_value * ff1
+
         w_linear = self.param(
-            "linear", nn.initializers.lecun_normal(in_axis=-2, out_axis=-1), (self.hidden_dim, self.features)
+            "linear",
+            nn.initializers.lecun_normal(in_axis=-2, out_axis=-1),
+            (self.hidden_dim, self.features),
         ).astype(dtype)
         outputs = jnp.dot(activations, w_linear)
         assert outputs.dtype == dtype
@@ -227,24 +285,25 @@ class FeedForward(nn.Module):
 
 
 def _flow_cross_attn(q_hidden, flow, flow_mask, flow_params, slot, *, head_dim):
-    """Gated cross-attention from expert-1 hidden states to flow tokens."""
+    """Gated cross-attention from expert-1 hidden states to flow tokens.
+
+    q_hidden: [b, s, D] expert-1 hidden states (already pre-normalized).
+    flow: [b, n_flow, D] flow tokens. flow_mask: [b, n_flow] bool validity.
+    flow_params: dict of slot-stacked parameters; slot: int (which slot to use).
+    """
     dtype = q_hidden.dtype
-    q = jnp.einsum("bsd,ndh->bsnh", q_hidden, flow_params["flow_q"][slot])
-    k = jnp.einsum("bfd,ndh->bfnh", flow, flow_params["flow_kv"][slot][0])
-    v = jnp.einsum("bfd,ndh->bfnh", flow, flow_params["flow_kv"][slot][1])
+    q = jnp.einsum("bsd,ndh->bsnh", q_hidden, flow_params["flow_q"][slot])  # [b, s, n, h]
+    k = jnp.einsum("bfd,ndh->bfnh", flow, flow_params["flow_kv"][slot][0])  # [b, n_flow, n, h]
+    v = jnp.einsum("bfd,ndh->bfnh", flow, flow_params["flow_kv"][slot][1])  # [b, n_flow, n, h]
     q = q * (head_dim**-0.5)
     logits = jnp.einsum(
         "bsnh,bfnh->bnsf", q.astype(jnp.float32), k.astype(jnp.float32), preferred_element_type=jnp.float32
     )
-    big_neg = -2.3819763e38
-    logits = jnp.where(flow_mask[:, None, None, :], logits, big_neg)
+    big_neg = -2.3819763e38  # See gemma/modules.py
+    logits = jnp.where(flow_mask[:, None, None, :], logits, big_neg)  # mask over k tokens
     probs = jax.nn.softmax(logits, axis=-1).astype(dtype)
-    # A fully-masked row otherwise becomes an artificial uniform distribution because all
-    # logits are the same large negative value. Force such rows to the exact no-flow output.
-    has_valid_flow = jnp.any(flow_mask, axis=-1)[:, None, None, None]
-    probs = jnp.where(has_valid_flow, probs, jnp.zeros_like(probs))
-    out = jnp.einsum("bnsf,bfnh->bsnh", probs, v)
-    return jnp.einsum("bsnh,nhd->bsd", out, flow_params["flow_out"][slot])
+    out = jnp.einsum("bnsf,bfnh->bsnh", probs, v)  # [b, s, n, h]
+    return jnp.einsum("bsnh,nhd->bsd", out, flow_params["flow_out"][slot])  # [b, s, D]
 
 
 def _flow_rmsnorm(x, scale):
@@ -256,9 +315,13 @@ def _flow_rmsnorm(x, scale):
 
 @at.typecheck
 class Block(nn.Module):
+    """Transformer block."""
+
     configs: tuple[Config, ...]
+
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()
+    # flowpi: if true, apply flow cross-attention injection at the end of this block for expert 1.
     flow_enabled: bool = False
 
     @nn.compact
@@ -273,30 +336,34 @@ class Block(nn.Module):
         positions,
         attn_mask,
         adarms_cond,
-        deterministic=True,
+        deterministic=True,  # noqa: FBT002
     ):
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
+
         attn = Attention(configs=self.configs, name="attn")
+
         pre_attn = []
         gates = []
         for i, x in enumerate(xs):
             if x is not None:
-                x, gate = RMSNorm(name=_name("pre_attention_norm", i))(x, adarms_cond[i])
+                x, gate = RMSNorm(name=_name("pre_attention_norm", i))(x, adarms_cond[i])  # noqa: PLW2901
             pre_attn.append(x)
             gates.append(gate if x is not None else None)
+
         pre_attn = sharding.activation_sharding_constraint(pre_attn)
         post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)
         post_attn = jax.tree.map(lambda x: drop(x, deterministic), post_attn)
         post_attn = sharding.activation_sharding_constraint(post_attn)
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, post_attn, gates, strict=True)]
         xs = sharding.activation_sharding_constraint(xs)
+
         out = []
         gates = []
         for i, (x, config) in enumerate(zip(xs, self.configs, strict=True)):
             if x is not None:
-                x, gate = RMSNorm(name=_name("pre_ffw_norm", i))(x, adarms_cond[i])
-                x = lora.FeedForward(
+                x, gate = RMSNorm(name=_name("pre_ffw_norm", i))(x, adarms_cond[i])  # noqa: PLW2901
+                x = lora.FeedForward(  # noqa: PLW2901
                     features=config.width,
                     hidden_dim=config.mlp_dim,
                     name=_name("mlp", i),
@@ -304,9 +371,11 @@ class Block(nn.Module):
                 )(x)
             out.append(x)
             gates.append(gate if x is not None else None)
+
         out = sharding.activation_sharding_constraint(out)
         out = jax.tree.map(lambda x: drop(x, deterministic), out)
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, out, gates, strict=True)]
+
         if self.flow_enabled:
             head_dim = flow_params["flow_q"].shape[-1]
 
@@ -315,10 +384,14 @@ class Block(nn.Module):
                 ca = _flow_cross_attn(hn, flow, flow_mask, flow_params, flow_slot, head_dim=head_dim)
                 return h + jnp.tanh(flow_params["flow_gate"][flow_slot]).astype(h.dtype) * ca.astype(h.dtype)
 
+            # Non-injection layers skip the cross-attention matmul entirely. Prefix-only passes
+            # (expert 1 is None) skip injection as well.
             if xs[1] is not None:
                 new_h = jax.lax.cond(flow_slot >= 0, inject, lambda h: h, xs[1])
                 xs = [xs[0], new_h]
+
         xs = sharding.activation_sharding_constraint(xs)
+
         return xs, kv_cache
 
 
@@ -327,6 +400,9 @@ KVCache: TypeAlias = tuple[at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array
 
 @dataclasses.dataclass(frozen=True)
 class FlowGeom:
+    """Geometry of the flowpi flow cross-attention (parameters live in the outer Module, one set
+    per injection layer slot — NOT stacked along depth)."""
+
     num_heads: int = 8
     head_dim: int = 128
     injection_layers: tuple[int, ...] = (7, 12, 16)
@@ -334,27 +410,47 @@ class FlowGeom:
 
 @at.typecheck
 class Module(nn.Module):
-    configs: Sequence[Config]
+    """Transformer model, supporting a mixture of different weights for different tokens."""
+
+    configs: Sequence[Config]  # list of configs, one for each expert
     embed_dtype: str
+
     dropout: float = 0.0
-    dropout_bdims: tuple[int, ...] = ()
+    dropout_bdims: tuple[int, ...] = ()  # Every float is dropped independently.
     adarms: bool = False
+    # flowpi: flow cross-attention geometry. None keeps the module identical to the baseline.
     flow_geom: FlowGeom | None = None
 
     def setup(self):
+        # all experts must have the same depth
         assert all(config.depth == self.configs[0].depth for config in self.configs)
-        self.embedder = Embedder(vocab_size=PALIGEMMA_VOCAB_SIZE, embed_dim=self.configs[0].width, name="embedder")
+
+        self.embedder = Embedder(
+            vocab_size=PALIGEMMA_VOCAB_SIZE,
+            embed_dim=self.configs[0].width,  # embedder for first expert only
+            name="embedder",
+        )
         block_cls = nn.remat(
             Block,
             prevent_cse=False,
-            static_argnums=(10,),
+            static_argnums=(10,),  # 0=self, 10=deterministic
             policy=jax.checkpoint_policies.nothing_saveable,
         )
         self.layers = nn.scan(
             block_cls,
             variable_axes={"params": 0},
             split_rngs={"params": True, "dropout": True},
-            in_axes=(0, nn.broadcast, nn.broadcast, nn.broadcast, 0, nn.broadcast, nn.broadcast, nn.broadcast, nn.broadcast),
+            in_axes=(
+                0,  # kv_cache
+                nn.broadcast,  # flow
+                nn.broadcast,  # flow_mask
+                nn.broadcast,  # flow_params
+                0,  # flow_slot
+                nn.broadcast,  # positions
+                nn.broadcast,  # mask
+                nn.broadcast,  # adarms_cond
+                nn.broadcast,  # deterministic
+            ),
             length=self.configs[0].depth,
         )(
             configs=self.configs,
@@ -363,12 +459,15 @@ class Module(nn.Module):
             flow_enabled=self.flow_geom is not None,
         )
         self.final_norms = [RMSNorm(name=_name("final_norm", i)) for i in range(len(self.configs))]
+
         if self.flow_geom is not None:
             n_slots = len(self.flow_geom.injection_layers)
             n_heads, head_dim = self.flow_geom.num_heads, self.flow_geom.head_dim
             width_e1 = self.configs[1].width
             lecun_2d = nn.initializers.lecun_normal(in_axis=-2, out_axis=-1)
             lecun_3d = nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0, 1))
+            # Slot-stacked flow cross-attention parameters. Created in the outer module (outside
+            # the depth scan) so they exist exactly once per slot, not depth times.
             self.flow_q = self.param("flow_q", lecun_2d, (n_slots, n_heads, width_e1, head_dim))
             self.flow_kv = self.param("flow_kv", lecun_3d, (n_slots, 2, n_heads, width_e1, head_dim))
             self.flow_out = self.param(
@@ -376,8 +475,11 @@ class Module(nn.Module):
                 nn.initializers.lecun_normal(in_axis=(-3, -2), out_axis=-1),
                 (n_slots, n_heads, head_dim, width_e1),
             )
+            # The ONLY zero-initialized flow parameters (initial tanh(gate)=0 => exact π0.5 equivalence).
             self.flow_gate = self.param("flow_gate", nn.initializers.zeros_init(), (n_slots, width_e1))
-            self.flow_pre_norm_scale = self.param("flow_pre_norm_scale", nn.initializers.zeros_init(), (n_slots, width_e1))
+            self.flow_pre_norm_scale = self.param(
+                "flow_pre_norm_scale", nn.initializers.zeros_init(), (n_slots, width_e1)
+            )
 
     @at.typecheck
     def embed(self, tokens: at.Int[at.Array, "b t"]) -> at.Float[at.Array, "b t d"]:
@@ -404,20 +506,22 @@ class Module(nn.Module):
     @at.typecheck
     def __call__(
         self,
-        embedded,
-        positions,
-        mask,
-        adarms_cond=None,
+        # list of token arrays, one for each expert, or None if that expert should not be run
+        embedded: Sequence[at.Float[at.Array, "b _t _d"] | None],
+        positions: at.Int[at.Array, "b t"],
+        mask: at.Bool[at.Array, "b t s"],
+        adarms_cond: Sequence[at.Float[at.Array, "b _d"] | at.Float[at.Array, "b _s _d"] | None] | None = None,
         *,
-        flow=None,
-        flow_mask=None,
-        kv_cache=None,
+        flow: at.Float[at.Array, "b _f _d"] | None = None,
+        flow_mask: at.Bool[at.Array, "b _f"] | None = None,
+        kv_cache: KVCache | None = None,
         deterministic: bool = True,
-    ):
+    ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
+
         if self.flow_geom is not None:
             flow_slot = self._make_flow_slot()
             flow_params = self._make_flow_params()
@@ -433,15 +537,19 @@ class Module(nn.Module):
             flow_params = None
             flow = None
             flow_mask = None
+
         embedded, kv_cache = self.layers(
             embedded, kv_cache, flow, flow_mask, flow_params, flow_slot, positions, mask, adarms_cond, deterministic
         )
+
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
+
         return [
             f(e, a)[0] if e is not None else e for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
         ], kv_cache
 
     def init(self, use_adarms: Sequence[bool]):
+        """Convenience method for initializing all parameters, necessary due to the quirks of linen."""
         self.embed(jnp.zeros((1, 1), dtype=jnp.int32))
         self(
             [jnp.zeros((1, 1, c.width)) for c in self.configs],
@@ -452,19 +560,29 @@ class Module(nn.Module):
 
 
 def _apply_rope(x, *, positions, max_wavelength=10_000):
+    """Applies RoPE positions [B, L] to x [B, L, H, D]."""
     freq_exponents = (2.0 / x.shape[-1]) * jnp.arange(x.shape[-1] // 2, dtype=jnp.float32)
     timescale = max_wavelength**freq_exponents
     radians = positions[..., None] / timescale[None, None, :]
     radians = radians[..., None, :]
     assert radians.dtype == jnp.float32
+    # radians.shape = [...,L,1,d=D/2]
     sin, cos = jnp.sin(radians), jnp.cos(radians)
     x1, x2 = jnp.split(x, 2, axis=-1)
     res = jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
     assert res.dtype == jnp.float32
+    # The original bigvision impl allows RoPE to upcast to float32. It is then immediately downcast again to the cache
+    # dtype when in inference mode (but not in training mode). I don't think any of this was intentional. Based on the
+    # original DeepMind impl, as well as the widely-used transformers impl, it is ok to always downcast back to bfloat16
+    # here.
     return res.astype(x.dtype)
 
 
 def _name(name, i):
+    # we name layers like this because we want the first expert's weights to have no suffix (e.g., "attn"), so that they
+    # can be loaded seamlessly from the existing PaliGemma checkpoint. subsequent experts will have a suffix (e.g.,
+    # "attn_1") and their weights will be initialized from scratch. in practice, we only use two experts -- PaliGemma,
+    # and the action expert.
     if i == 0:
         return name
     return f"{name}_{i}"

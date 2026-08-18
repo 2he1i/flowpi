@@ -315,9 +315,7 @@ class Pi0(_model.BaseModel):
                 ),
             )  # [B, H]
             # τ jitter on the middle segment only (endpoints stay exact).
-            jitter = jax.random.uniform(
-                jitter_rng, actions.shape[:-1], minval=-cfg.tau_jitter, maxval=cfg.tau_jitter
-            )
+            jitter = jax.random.uniform(jitter_rng, actions.shape[:-1], minval=-cfg.tau_jitter, maxval=cfg.tau_jitter)
             mid = (tau_stair > 0) & (tau_stair < 1)
             tau_stair = jnp.where(mid, jnp.clip(tau_stair + jitter, 0.0, 1.0), tau_stair)
 

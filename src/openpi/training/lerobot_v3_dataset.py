@@ -45,9 +45,7 @@ class _V3Meta:
             self.info = json.load(f)
         version = self.info.get("codebase_version", "")
         if not version.startswith("v3"):
-            raise ValueError(
-                f"LeRobotV3ParquetDataset only supports v3.0 datasets, got codebase_version={version}"
-            )
+            raise ValueError(f"LeRobotV3ParquetDataset only supports v3.0 datasets, got codebase_version={version}")
         self.fps = self.info["fps"]
         self.features = self.info["features"]
         self.tasks = self._load_tasks(root)
@@ -63,10 +61,7 @@ class _V3Meta:
         idx_col = "task_index" if "task_index" in columns else None
         tasks = {}
         strings = table.column(task_str_col).to_pylist()
-        if idx_col is not None:
-            indices = table.column(idx_col).to_pylist()
-        else:
-            indices = range(len(strings))
+        indices = table.column(idx_col).to_pylist() if idx_col is not None else range(len(strings))
         for i, s in zip(indices, strings, strict=True):
             tasks[int(i)] = s
         return tasks
@@ -83,9 +78,7 @@ class LeRobotV3ParquetDataset:
         self.root = pathlib.Path(root)
         self.meta = _V3Meta(self.root)
         self.delta_timestamps = {k: list(v) for k, v in (delta_timestamps or {}).items()}
-        self._delta_indices = {
-            k: [int(round(dt * self.meta.fps)) for dt in v] for k, v in self.delta_timestamps.items()
-        }
+        self._delta_indices = {k: [round(dt * self.meta.fps) for dt in v] for k, v in self.delta_timestamps.items()}
 
         self._episodes: list[_EpisodeEntry] = self._load_episodes()
         # Global (from, to) index range per episode.
@@ -200,7 +193,7 @@ class LeRobotV3ParquetDataset:
 
     def __getitem__(self, idx: int) -> dict:
         idx = int(idx)
-        for ep_i, (ep, (ep_start, ep_end)) in enumerate(zip(self._episodes, self._ep_bounds, strict=True)):
+        for ep, (ep_start, ep_end) in zip(self._episodes, self._ep_bounds, strict=True):  # noqa: B007
             if ep_start <= idx < ep_end:
                 break
         else:

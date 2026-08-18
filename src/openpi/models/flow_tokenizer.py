@@ -45,7 +45,7 @@ class FlowTokenizer(nnx.Module):
 
         convs = []
         in_ch = 2
-        for i, out_ch in enumerate(channels):
+        for _i, out_ch in enumerate(channels):
             convs.append(
                 nnx.Conv(
                     in_features=in_ch,
@@ -79,8 +79,6 @@ class FlowTokenizer(nnx.Module):
         # Recomputed on the fly (cheap sincos tables) instead of being stored as a module
         # attribute, so nnx.split works (plain array leaves are not supported).
         pos_dim = hidden // 2
-        rows = _pi0.posemb_sincos(jnp.arange(self.grid_h, dtype=jnp.float32), pos_dim, 1e-3, 1e3)
-        cols = _pi0.posemb_sincos(jnp.arange(self.grid_w, dtype=jnp.float32), pos_dim, 1e-3, 1e3)
         self._pos_spec = (pos_dim, self.grid_h, self.grid_w)
 
         # Learned lag / camera embeddings (normal init 0.02).
@@ -103,8 +101,10 @@ class FlowTokenizer(nnx.Module):
         rows = _pi0.posemb_sincos(jnp.arange(gh, dtype=jnp.float32), pos_dim, 1e-3, 1e3)
         cols = _pi0.posemb_sincos(jnp.arange(gw, dtype=jnp.float32), pos_dim, 1e-3, 1e3)
         return jnp.concatenate(
-            [jnp.broadcast_to(rows[:, None, :], (gh, gw, pos_dim)),
-             jnp.broadcast_to(cols[None, :, :], (gh, gw, pos_dim))],
+            [
+                jnp.broadcast_to(rows[:, None, :], (gh, gw, pos_dim)),
+                jnp.broadcast_to(cols[None, :, :], (gh, gw, pos_dim)),
+            ],
             axis=-1,
         )
 
@@ -122,8 +122,7 @@ class FlowTokenizer(nnx.Module):
             raise ValueError(f"Flow grid mismatch: convs produced {gh}x{gw}, expected {self.grid_h}x{self.grid_w}")
         x = x.reshape(b * k, gh * gw, -1)
         x = x + self._pos_emb().reshape(gh * gw, -1)
-        tokens = x.reshape(b, k * gh * gw, -1)
-        return tokens
+        return x.reshape(b, k * gh * gw, -1)
 
     def __call__(self, flow: dict, flow_masks: dict) -> tuple[jax.Array, jax.Array]:
         """Returns (tokens [B, n_cam*K*gh*gw, width], token_mask [B, n_cam*K*gh*gw])."""

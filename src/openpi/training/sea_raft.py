@@ -66,7 +66,13 @@ class SeaRaftFlowExtractor:
         iters: Number of refinement iterations (default from the variant config).
     """
 
-    def __init__(self, ckpt_path: str | pathlib.Path | None = None, variant: str = "M", device: str = "cpu", iters: int | None = None):
+    def __init__(
+        self,
+        ckpt_path: str | pathlib.Path | None = None,
+        variant: str = "M",
+        device: str = "cpu",
+        iters: int | None = None,
+    ):
         if variant not in _VARIANT_CONFIGS:
             raise ValueError(f"Unknown SEA-RAFT variant: {variant}. Choose from {list(_VARIANT_CONFIGS)}")
 

@@ -27,8 +27,7 @@ def make_staircase_tau(horizon: int, d: int) -> jax.Array:
     """
     pos = jnp.arange(horizon)
     mid = (pos - d) / (horizon - 2 * d)
-    tau = jnp.where(pos < d, 0.0, jnp.where(pos >= horizon - d, 1.0, mid))
-    return tau
+    return jnp.where(pos < d, 0.0, jnp.where(pos >= horizon - d, 1.0, mid))
 
 
 def make_attn_mask(input_mask, mask_ar):
@@ -232,10 +231,7 @@ class Pi0(_model.BaseModel):
             time_emb = self.time_mlp_out(time_emb)
             time_emb = nnx.swish(time_emb)
             action_expert_tokens = action_tokens
-            if per_position:
-                adarms_cond = time_emb  # [B, H, emb]
-            else:
-                adarms_cond = time_emb  # [B, emb]
+            adarms_cond = time_emb  # [B, (H), emb]
         else:
             # mix timestep + action information using an MLP (no adaRMS)
             assert not per_position, "per-position timesteps require the pi05 architecture"
@@ -281,7 +277,9 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask, adarms_cond
 
-    def embed_flow(self, obs: _model.Observation) -> tuple[at.Float[at.Array, "b f emb"], at.Bool[at.Array, "b f"]] | None:
+    def embed_flow(
+        self, obs: _model.Observation
+    ) -> tuple[at.Float[at.Array, "b f emb"], at.Bool[at.Array, "b f"]] | None:
         """Tokenizes the (normalized) optical flow into cross-attention tokens. Returns None when
         the flow fast-path is disabled or the observation carries no flow."""
         if self.flow_config is None or obs.flow is None:
@@ -311,7 +309,9 @@ class Pi0(_model.BaseModel):
             tau_stair = jnp.where(
                 pos[None, :] < d[:, None],
                 0.0,
-                jnp.where(pos[None, :] >= horizon - d[:, None], 1.0, (pos[None, :] - d[:, None]) / (horizon - 2 * d[:, None])),
+                jnp.where(
+                    pos[None, :] >= horizon - d[:, None], 1.0, (pos[None, :] - d[:, None]) / (horizon - 2 * d[:, None])
+                ),
             )  # [B, H]
             # τ jitter on the middle segment only (endpoints stay exact).
             jitter = jax.random.uniform(time_rng, actions.shape[:-1], minval=-cfg.tau_jitter, maxval=cfg.tau_jitter)
@@ -486,7 +486,6 @@ class Pi0(_model.BaseModel):
 
     def _suffix_forward(self, observation, x_t, tau, kv_cache, prefix_mask, flow_embedded):
         """One forward pass over the suffix (state token + action tokens) against the cached prefix."""
-        batch_size = observation.state.shape[0]
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, tau)
         suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
         prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])

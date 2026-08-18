@@ -405,7 +405,9 @@ class LoadFlowCache(DataTransformFn):
 
         meta_path = self.flow_cache_dir / "meta.json"
         if not meta_path.exists():
-            raise FileNotFoundError(f"Flow cache meta not found: {meta_path}. Run scripts/precompute_flow_cache.py first.")
+            raise FileNotFoundError(
+                f"Flow cache meta not found: {meta_path}. Run scripts/precompute_flow_cache.py first."
+            )
         with open(meta_path) as f:
             meta = json.load(f)
         expected = {

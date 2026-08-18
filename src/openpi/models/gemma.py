@@ -470,10 +470,16 @@ class Module(nn.Module):
             # the depth scan) so they exist exactly once per slot, not depth times.
             self.flow_q = self.param("flow_q", lecun_2d, (n_slots, n_heads, width_e1, head_dim))
             self.flow_kv = self.param("flow_kv", lecun_3d, (n_slots, 2, n_heads, width_e1, head_dim))
-            self.flow_out = self.param("flow_out", nn.initializers.lecun_normal(in_axis=(-3, -2), out_axis=-1), (n_slots, n_heads, head_dim, width_e1))
+            self.flow_out = self.param(
+                "flow_out",
+                nn.initializers.lecun_normal(in_axis=(-3, -2), out_axis=-1),
+                (n_slots, n_heads, head_dim, width_e1),
+            )
             # The ONLY zero-initialized flow parameters (initial tanh(gate)=0 => exact π0.5 equivalence).
             self.flow_gate = self.param("flow_gate", nn.initializers.zeros_init(), (n_slots, width_e1))
-            self.flow_pre_norm_scale = self.param("flow_pre_norm_scale", nn.initializers.zeros_init(), (n_slots, width_e1))
+            self.flow_pre_norm_scale = self.param(
+                "flow_pre_norm_scale", nn.initializers.zeros_init(), (n_slots, width_e1)
+            )
 
     @at.typecheck
     def embed(self, tokens: at.Int[at.Array, "b t"]) -> at.Float[at.Array, "b t d"]:
@@ -521,7 +527,10 @@ class Module(nn.Module):
             flow_params = self._make_flow_params()
             if flow is None:
                 batch_size = next(e.shape[0] for e in embedded if e is not None)
-                flow = jnp.zeros((batch_size, 1, self.configs[1].width), dtype=jnp.dtype(self.embed_dtype) if isinstance(self.embed_dtype, str) else self.embed_dtype)
+                flow = jnp.zeros(
+                    (batch_size, 1, self.configs[1].width),
+                    dtype=jnp.dtype(self.embed_dtype) if isinstance(self.embed_dtype, str) else self.embed_dtype,
+                )
                 flow_mask = jnp.ones((batch_size, 1), dtype=jnp.bool_)
         else:
             flow_slot = jnp.full((self.configs[0].depth,), -1, dtype=jnp.int32)

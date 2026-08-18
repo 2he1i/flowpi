@@ -35,7 +35,7 @@ def _parse_args():
     known, remaining = parser.parse_known_args()
     import openpi.training.config as _config
 
-    configs = {k: (k, v) for k, v in _config._CONFIGS_DICT.items()}
+    configs = {k: (k, v) for k, v in _config._CONFIGS_DICT.items()}  # noqa: SLF001
     train_config = tyro.extras.overridable_config_cli(configs, args=remaining, prog="precompute_flow_cache")
     return known, train_config
 
@@ -47,15 +47,15 @@ def _episode_entries(root: pathlib.Path) -> list[dict]:
         columns = table.column_names
         chunk_col = "data/chunk_index" if "data/chunk_index" in columns else "chunk_index"
         file_col = "data/file_index" if "data/file_index" in columns else "file_index"
-        for row in range(table.num_rows):
-            entries.append(
-                {
-                    "episode_index": int(table.column("episode_index")[row].as_py()),
-                    "length": int(table.column("length")[row].as_py()),
-                    "chunk_index": int(table.column(chunk_col)[row].as_py()),
-                    "file_index": int(table.column(file_col)[row].as_py()),
-                }
-            )
+        entries.extend(
+            {
+                "episode_index": int(table.column("episode_index")[row].as_py()),
+                "length": int(table.column("length")[row].as_py()),
+                "chunk_index": int(table.column(chunk_col)[row].as_py()),
+                "file_index": int(table.column(file_col)[row].as_py()),
+            }
+            for row in range(table.num_rows)
+        )
     entries.sort(key=lambda e: e["episode_index"])
     return entries
 
@@ -108,12 +108,13 @@ def _process_episode(task: dict) -> dict:
         for k in range(1, k_num + 1):
             if t >= k * stride:
                 valid[t, k - 1] = True
-                for cam in task["cam_keys"]:
-                    pairs.append((t, k, cam))
+                pairs.extend((t, k, cam) for cam in task["cam_keys"])
 
     flows = {cam: np.zeros((t_len, k_num, 2, height // 8, width // 8), dtype=np.float16) for cam in task["cam_keys"]}
 
-    for start in tqdm(range(0, len(pairs), batch_size), desc=f"ep{entry['episode_index']:06d}", disable=not task["verbose"]):
+    for start in tqdm(
+        range(0, len(pairs), batch_size), desc=f"ep{entry['episode_index']:06d}", disable=not task["verbose"]
+    ):
         chunk = pairs[start : start + batch_size]
         prev = np.stack([frames[cam][t - k * stride] for t, k, cam in chunk], axis=0)[None]
         curr = np.stack([frames[cam][t] for t, k, cam in chunk], axis=0)[None]

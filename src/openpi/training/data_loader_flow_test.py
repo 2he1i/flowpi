@@ -86,7 +86,8 @@ def test_online_flow_sample():
         assert list(sample["flow_masks"][cam]) == [False, False]
     assert sample["image"]["base_0_rgb"].shape == (224, 224, 3)  # single frame, resized by model transforms
     assert sample["actions"].shape == (50, 32)  # padded to action_dim by model transforms
-    assert "vlm_delay" in sample and 0 <= sample["vlm_delay"] <= 2
+    assert "vlm_delay" in sample
+    assert 0 <= sample["vlm_delay"] <= 2
 
     # Interior frame: both lags valid.
     sample = _get_sample(train_config, 10)
@@ -106,7 +107,11 @@ def test_cache_roundtrip_matches_online(tmp_path):
     task = {
         "root": str(_TEST_DATA),
         "entry": entries[0],
-        "cam_keys": ["observation.images.cam_high", "observation.images.cam_left_wrist", "observation.images.cam_right_wrist"],
+        "cam_keys": [
+            "observation.images.cam_high",
+            "observation.images.cam_left_wrist",
+            "observation.images.cam_right_wrist",
+        ],
         "num_flow_steps": 2,
         "flow_stride_frames": 3,
         "flow_cache_dir": cache_dir,
@@ -130,9 +135,7 @@ def test_cache_roundtrip_matches_online(tmp_path):
         online_sample = _get_sample(online_config, index)
         cache_sample = _get_sample(cache_config, index)
         for cam in online_sample["flow"]:
-            np.testing.assert_allclose(
-                cache_sample["flow"][cam], online_sample["flow"][cam], atol=0.1, rtol=0.1
-            )
+            np.testing.assert_allclose(cache_sample["flow"][cam], online_sample["flow"][cam], atol=0.1, rtol=0.1)
             np.testing.assert_array_equal(cache_sample["flow_masks"][cam], online_sample["flow_masks"][cam])
 
 
@@ -177,7 +180,10 @@ def test_flow_disabled_matches_baseline():
     )
     train_config = _config.TrainConfig(name="test_flowpi_data", exp_name="test", model=model, data=baseline)
     sample = _get_sample(train_config, 10)
-    assert "flow" not in sample and "flow_masks" not in sample and "vlm_delay" not in sample
-    assert "episode_index" not in sample and "frame_index" not in sample
+    assert "flow" not in sample
+    assert "flow_masks" not in sample
+    assert "vlm_delay" not in sample
+    assert "episode_index" not in sample
+    assert "frame_index" not in sample
     assert sample["image"]["base_0_rgb"].shape == (224, 224, 3)
     assert sample["actions"].shape == (50, 32)

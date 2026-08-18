@@ -4,7 +4,6 @@ Covers: zero-gate equivalence, init gradient invariants, parameter budget, stair
 construction/self-similarity, per-position RMSNorm, and the streaming runtime.
 """
 
-
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
@@ -16,13 +15,13 @@ import openpi.models.pi0_config as _pi0_config
 
 
 def _flow_config(**overrides) -> _pi0_config.FlowConfig:
-    defaults = dict(
-        num_flow_steps=2,
-        flow_stride_frames=3,
-        d_max=2,
-        injection_layers=(1, 2),
-        vlm_delay_max=3,
-    )
+    defaults = {
+        "num_flow_steps": 2,
+        "flow_stride_frames": 3,
+        "d_max": 2,
+        "injection_layers": (1, 2),
+        "vlm_delay_max": 3,
+    }
     defaults.update(overrides)
     return _pi0_config.FlowConfig(**defaults)
 
@@ -64,7 +63,9 @@ def _copy_shared_params(src_model, dst_model):
 
 def _fake_obs(config, batch_size=2, seed=1):
     obs = config.fake_obs(batch_size=batch_size)
-    return jax.tree.map(lambda x: jax.random.normal(jax.random.key(seed), x.shape, x.dtype) if x.dtype == jnp.float32 else x, obs)
+    return jax.tree.map(
+        lambda x: jax.random.normal(jax.random.key(seed), x.shape, x.dtype) if x.dtype == jnp.float32 else x, obs
+    )
 
 
 def test_zero_gate_equivalence():
@@ -124,9 +125,14 @@ def test_zero_gate_equivalence_no_flow_input():
 
     obs = _fake_obs(config)
     obs_noflow = type(obs)(
-        images=obs.images, image_masks=obs.image_masks, state=obs.state,
-        tokenized_prompt=obs.tokenized_prompt, tokenized_prompt_mask=obs.tokenized_prompt_mask,
-        flow=None, flow_masks=None, vlm_delay=None,
+        images=obs.images,
+        image_masks=obs.image_masks,
+        state=obs.state,
+        tokenized_prompt=obs.tokenized_prompt,
+        tokenized_prompt_mask=obs.tokenized_prompt_mask,
+        flow=None,
+        flow_masks=None,
+        vlm_delay=None,
     )
     actions = jax.random.normal(jax.random.key(2), (2, config.action_horizon, config.action_dim))
     time = jnp.full((2,), 0.3)
@@ -299,7 +305,6 @@ def test_streaming_runtime():
         assert int(state.prefix_age[0]) == tick + 1
 
     # Tail of the buffer holds fresh noise ~ N(0, 1).
-    tail = state.action_buffer[0, -2]
     assert float(jnp.std(state.action_buffer[:, -2:])) > 0.1
 
     refreshed = model.refresh_prefix(state, obs)

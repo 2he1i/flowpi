@@ -328,9 +328,7 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
                     flow_scale=model_flow.flow_scale,
                     flow_clamp=model_flow.flow_clamp,
                 )
-            delay_transform = _transforms.DelaySlowImage(
-                model_flow.vlm_delay_max, frame_offsets, seed=0
-            )
+            delay_transform = _transforms.DelaySlowImage(model_flow.vlm_delay_max, frame_offsets, seed=0)
             data_transforms = _transforms.Group(
                 inputs=[flow_transform, delay_transform, *data_transforms.inputs],
                 outputs=data_transforms.outputs,
@@ -339,7 +337,14 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
             # Merge them into the main repack structure (RepackTransform drops unmapped keys).
             repack_transforms = _transforms.Group(
                 inputs=tuple(
-                    dataclasses.replace(transform, structure={**transform.structure, "episode_index": "episode_index", "frame_index": "frame_index"})
+                    dataclasses.replace(
+                        transform,
+                        structure={
+                            **transform.structure,
+                            "episode_index": "episode_index",
+                            "frame_index": "frame_index",
+                        },
+                    )
                     if isinstance(transform, _transforms.RepackTransform)
                     else transform
                     for transform in repack_transforms.inputs
@@ -1121,7 +1126,9 @@ _CONFIGS = [
             ),
         ),
         weight_loader=weight_loaders.FlowPiWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        freeze_filter=pi0_config.Pi0Config(pi05=True, discrete_state_input=False, flow=pi0_config.FlowConfig()).get_freeze_filter(),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, discrete_state_input=False, flow=pi0_config.FlowConfig()
+        ).get_freeze_filter(),
         num_train_steps=20_000,
         batch_size=32,
     ),

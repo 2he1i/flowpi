@@ -84,6 +84,10 @@ class Pi0Config(_model.BaseModelConfig):
                 "max-autotune",
                 "max-autotune-no-cudagraphs",
             ]
+        if self.flow is not None and self.flow.enabled:
+            assert self.flow.d_max < self.action_horizon / 2, (
+                f"flow.d_max ({self.flow.d_max}) must be < action_horizon/2 ({self.action_horizon / 2})"
+            )
 
     @property
     @override
@@ -103,6 +107,22 @@ class Pi0Config(_model.BaseModelConfig):
         image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
+        flow = self.flow
+        flow_spec = None
+        flow_masks_spec = None
+        if flow is not None and flow.enabled:
+            h, w = flow.flow_image_size[0] // 8, flow.flow_image_size[1] // 8
+            flow_spec = {
+                "base_0_rgb": jax.ShapeDtypeStruct([batch_size, flow.num_flow_steps, 2, h, w], jnp.float32),
+                "left_wrist_0_rgb": jax.ShapeDtypeStruct([batch_size, flow.num_flow_steps, 2, h, w], jnp.float32),
+                "right_wrist_0_rgb": jax.ShapeDtypeStruct([batch_size, flow.num_flow_steps, 2, h, w], jnp.float32),
+            }
+            flow_masks_spec = {
+                "base_0_rgb": jax.ShapeDtypeStruct([batch_size, flow.num_flow_steps], jnp.bool_),
+                "left_wrist_0_rgb": jax.ShapeDtypeStruct([batch_size, flow.num_flow_steps], jnp.bool_),
+                "right_wrist_0_rgb": jax.ShapeDtypeStruct([batch_size, flow.num_flow_steps], jnp.bool_),
+            }
+
         with at.disable_typechecking():
             observation_spec = _model.Observation(
                 images={
@@ -118,6 +138,13 @@ class Pi0Config(_model.BaseModelConfig):
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                flow=flow_spec,
+                flow_masks=flow_masks_spec,
+                vlm_delay=(
+                    jax.ShapeDtypeStruct([batch_size], jnp.int32)
+                    if flow is not None and flow.enabled and flow.vlm_delay_max > 0
+                    else None
+                ),
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 
@@ -151,5 +178,10 @@ class Pi0Config(_model.BaseModelConfig):
                 nnx.Not(nnx_utils.PathRegex(".*lora.*")),
             )
         if not filters:
+            # flowpi: with the flow fast-path enabled and no LoRA, freeze only the SigLIP vision
+            # tower (VT+SEA-RAFT frozen policy; VLM transformer / action expert / flow branch are
+            # fully trainable).
+            if self.flow is not None and self.flow.enabled:
+                return nnx_utils.PathRegex(r"PaliGemma/img.*")
             return nnx.Nothing
         return nnx.All(*filters)

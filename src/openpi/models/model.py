@@ -106,6 +106,15 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # flowpi fields (all optional; absent/None keeps the model identical to the baseline).
+
+    # Optical flow from the flowpi fast path, per camera: [*b, K, 2, H//8, W//8] (already normalized).
+    flow: at.PyTree[ArrayT] | None = None
+    # Per-lag flow validity, per camera: [*b, K].
+    flow_masks: at.PyTree[ArrayT] | None = None
+    # Slow-channel VLM delay (ticks since the last prefix refresh), int [*b].
+    vlm_delay: at.Int[ArrayT, "*b"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -126,6 +135,9 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            flow=data.get("flow"),
+            flow_masks=data.get("flow_masks"),
+            vlm_delay=data.get("vlm_delay"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -205,6 +217,9 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        flow=observation.flow,
+        flow_masks=observation.flow_masks,
+        vlm_delay=observation.vlm_delay,
     )
 
 

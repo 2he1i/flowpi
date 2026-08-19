@@ -72,6 +72,7 @@ def _run_runtime_test(sea_raft_device="cpu"):
         sea_raft_ckpt=None,
         sea_raft_device=sea_raft_device,
         d=1,
+        allow_random_init=True,
     )
 
     # Create 20 frames of dummy observations.
@@ -148,3 +149,60 @@ def test_runtime_cpu():
 
 def test_runtime_cuda():
     _run_runtime_test(sea_raft_device="cuda")
+
+
+def test_warm_start_second_episode_resets_ring():
+    """warm_start must start the ring buffer from scratch: stale frames of the previous episode
+    must not leak into the first ticks' flow."""
+    model = pi0_config.Pi0Config(
+        pi05=True,
+        discrete_state_input=False,
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+        action_dim=32,
+        action_horizon=12,
+        flow=_dummy_flow_config(),
+    ).create(jax.random.key(0))
+    h, w = 480, 640
+
+    runtime = flowpi_runtime.FlowPiRuntime(
+        model,
+        flow_config=_dummy_flow_config(),
+        sea_raft_ckpt=None,
+        sea_raft_device="cpu",
+        d=1,
+        allow_random_init=True,
+    )
+
+    def obs_for(images_value: float, state_key: int) -> _model.Observation:
+        images = {
+            cam: jnp.full((1, h, w, 3), images_value, dtype=jnp.float32)
+            for cam in ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
+        }
+        return _model.Observation(
+            images=images,
+            image_masks={cam: jnp.ones((1,), dtype=bool) for cam in images},
+            state=jax.random.uniform(jax.random.key(state_key), (1, 32), minval=-1.0, maxval=1.0),
+            tokenized_prompt=jnp.zeros((1, 10), dtype=jnp.int32),
+            tokenized_prompt_mask=jnp.ones((1, 10), dtype=bool),
+        )
+
+    # Episode A: several fast ticks on 0.25 frames (uint8 value 159).
+    runtime.warm_start(obs_for(0.25, 0))
+    for i in range(5):
+        runtime.tick(obs_for(0.25, i + 1))
+
+    # Episode B: warm_start again on +1.0 frames (uint8 value 255). The ring must be freshly
+    # initialised: slot 0 holds the new first frame, every other slot is the zero-init (a stale
+    # episode-A frame would be 159).
+    runtime.warm_start(obs_for(1.0, 100))
+    ring = runtime._ring  # noqa: SLF001
+    assert ring.base_index == 0
+    for cam in ring.cam_keys:
+        buf = np.asarray(ring.buffer[cam])
+        assert np.all(buf[0] == 255), f"first frame of episode B not in {cam}"
+        assert np.all(buf[1:] == 0), f"stale frames from episode A leaked into {cam}"
+
+    # The streaming state restarted as well: age 0 and a fresh finite action buffer.
+    assert int(runtime._streaming_state.prefix_age[0]) == 0  # noqa: SLF001
+    assert np.all(np.isfinite(np.asarray(runtime._streaming_state.action_buffer)))  # noqa: SLF001

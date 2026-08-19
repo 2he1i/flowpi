@@ -73,6 +73,8 @@ class FlowDataConfig:
     flow_cache_dir: str | None = None
     sea_raft_ckpt: str | None = None
     sea_raft_device: str = "cpu"
+    # Opt-in for random SEA-RAFT weights (tests/smoke runs only); production must pass a checkpoint.
+    sea_raft_allow_random_init: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -306,6 +308,7 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
                     ckpt_path=self.flow.sea_raft_ckpt or None,
                     variant="M",
                     device=self.flow.sea_raft_device,
+                    allow_random_init=self.flow.sea_raft_allow_random_init,
                 )
                 flow_transform: _transforms.DataTransformFn = _transforms.ComputeFlow(
                     extractor,

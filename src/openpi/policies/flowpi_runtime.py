@@ -97,6 +97,7 @@ class FlowPiRuntime:
         sea_raft_ckpt: str | None = None,
         sea_raft_device: str = "cuda",
         d: int = 1,
+        allow_random_init: bool = False,
     ):
         self.model = model
         self.flow_config = flow_config
@@ -115,6 +116,7 @@ class FlowPiRuntime:
             ckpt_path=sea_raft_ckpt,
             variant="M",
             device=sea_raft_device,
+            allow_random_init=allow_random_init,
         )
 
         # Slow-channel publication: a completed background prefix refresh is published here
@@ -203,6 +205,9 @@ class FlowPiRuntime:
 
         The caller should call ``refresh_prefix`` before the first ``tick``.
         """
+        # A new episode starts from an empty ring buffer: stale frames of the previous episode
+        # would otherwise leak into the first ticks' flow (cross-episode flow contamination).
+        self._ring = None
         self._ingest_frame(observation)
 
         self._streaming_state = self.model.warm_start(

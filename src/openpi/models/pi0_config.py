@@ -45,6 +45,29 @@ class FlowConfig:
     def __post_init__(self):
         if self.injection_layers is None:
             object.__setattr__(self, "injection_layers", (7, 12, 16))
+        if self.num_flow_steps <= 0:
+            raise ValueError(f"num_flow_steps must be positive, got {self.num_flow_steps}")
+        if self.flow_stride_frames <= 0:
+            raise ValueError(f"flow_stride_frames must be positive, got {self.flow_stride_frames}")
+        if self.flow_scale <= 0:
+            raise ValueError(f"flow_scale must be positive, got {self.flow_scale}")
+        if not 0.0 <= self.p_standard <= 1.0:
+            raise ValueError(f"p_standard must be in [0, 1], got {self.p_standard}")
+        if not 0.0 <= self.tau_jitter < 1.0:
+            raise ValueError(f"tau_jitter must be in [0, 1), got {self.tau_jitter}")
+        if self.vlm_delay_max < 0:
+            raise ValueError(f"vlm_delay_max must be non-negative, got {self.vlm_delay_max}")
+        if self.num_cross_heads <= 0:
+            raise ValueError(f"num_cross_heads must be positive, got {self.num_cross_heads}")
+        if self.cross_head_dim <= 0:
+            raise ValueError(f"cross_head_dim must be positive, got {self.cross_head_dim}")
+        if self.injection_layers is not None:
+            if any(layer < 0 for layer in self.injection_layers):
+                raise ValueError(f"injection_layers must be non-negative, got {self.injection_layers}")
+            if len(set(self.injection_layers)) != len(self.injection_layers):
+                raise ValueError(f"injection_layers must be unique, got {self.injection_layers}")
+        if len(self.flow_image_size) != 2 or any(s <= 0 or s % 8 != 0 for s in self.flow_image_size):
+            raise ValueError(f"flow_image_size must be (h, w) with h, w multiples of 8, got {self.flow_image_size}")
         if self.d_max <= 0:
             raise ValueError(f"d_max must be positive, got {self.d_max}")
 
@@ -178,10 +201,9 @@ class Pi0Config(_model.BaseModelConfig):
                 nnx.Not(nnx_utils.PathRegex(".*lora.*")),
             )
         if not filters:
-            # flowpi: with the flow fast-path enabled and no LoRA, freeze only the SigLIP vision
-            # tower (VT+SEA-RAFT frozen policy; VLM transformer / action expert / flow branch are
-            # fully trainable).
-            if self.flow is not None and self.flow.enabled:
-                return nnx_utils.PathRegex(r"PaliGemma/img.*")
-            return nnx.Nothing
+            # With no LoRA, freeze only the SigLIP vision tower for both the baseline and the
+            # flowpi model (frozen-vision policy; VLM transformer / action expert / flow branch
+            # are fully trainable). flowpi additionally keeps SEA-RAFT frozen outside the JAX
+            # parameter tree.
+            return nnx_utils.PathRegex(r"PaliGemma/img.*")
         return nnx.All(*filters)

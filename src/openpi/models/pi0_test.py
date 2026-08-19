@@ -12,9 +12,12 @@ def _get_frozen_state(config: _pi0_config.Pi0Config) -> nnx.State:
 
 
 def test_pi0_full_finetune():
+    """The baseline pi0 also freezes the SigLIP vision tower (frozen-vision policy, matching the
+    flowpi config)."""
     config = _pi0_config.Pi0Config()
     state = _get_frozen_state(config)
-    assert len(state) == 0
+    assert len(state) > 0
+    assert all(p[:2] == ("PaliGemma", "img") for p in state)
 
 
 def test_pi0_gemma_lora():

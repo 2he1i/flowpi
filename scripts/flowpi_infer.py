@@ -1,5 +1,10 @@
 """Offline replay of a FlowPi model on a dataset episode.
 
+The replay feeds the runtime the *fresh* observation pipeline (current frames, state, prompt) —
+exactly what online deployment produces. The runtime itself computes the online SEA-RAFT flow
+and the slow-channel delay; the training-only flow/delay transforms (ComputeFlow, LoadFlowCache,
+DelaySlowImage) and the camera history loading are therefore NOT applied here.
+
 Usage:
     uv run python scripts/flowpi_infer.py --config-name flowpi_aloha \
         --checkpoint /path/to/checkpoint --dataset test_data/adjust_bottle_ep0 \
@@ -7,10 +12,12 @@ Usage:
 """
 
 import argparse
+import dataclasses
 import pathlib
 import time
 
 import numpy as np
+import torch
 
 import openpi.models.model as _model
 import openpi.policies.flowpi_runtime as flowpi_runtime
@@ -22,9 +29,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config-name", required=True, help="Training config name (e.g. flowpi_aloha)")
     parser.add_argument("--checkpoint", required=True, help="Path to checkpoint directory")
-    parser.add_argument("--dataset", required=True, help="Local dataset root")
+    parser.add_argument("--dataset", required=True, help="Local dataset root (overrides the config repo_id)")
     parser.add_argument("--slow-every-n", type=int, default=10, help="Prefix refresh interval (ticks)")
     parser.add_argument("--max-frames", type=int, default=None, help="Limit the number of frames")
+    parser.add_argument("--skip-normalization", action="store_true", help="Skip state normalization (debug only)")
     args = parser.parse_args()
 
     # Load the config and create the model.
@@ -34,19 +42,35 @@ def main():
     if flow_cfg is None or not flow_cfg.enabled:
         raise ValueError("The model checkpoint must have flow enabled.")
 
-    # Prepare the offline dataset (single episode).
+    # Full (flow-enabled) config: carries the SEA-RAFT checkpoint/device used at training time.
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
-    # Build a minimal dataset — one sample per frame without action deltas.
-    dataset = _data_loader.create_torch_dataset(
-        data_config,
-        action_horizon=1,
-        model_config=train_config.model,
+
+    # Rebuild the data config with the flow pipeline disabled: the replay must feed the runtime
+    # fresh current frames + state + prompt, and the runtime computes the flow and the slow delay
+    # itself. Disabling flow also drops the camera history from the dataset (single-frame images).
+    runtime_data_config = dataclasses.replace(train_config.data, repo_id=args.dataset, flow=None).create(
+        train_config.assets_dirs, train_config.model
+    )
+
+    # Standard pipeline: repack + inputs (no flow/delay) + normalize + model transforms, one
+    # sample per frame, collated into a batch of 1 for the runtime.
+    dataset = _data_loader.transform_dataset(
+        _data_loader.create_torch_dataset(runtime_data_config, action_horizon=1, model_config=train_config.model),
+        runtime_data_config,
+        skip_norm_stats=args.skip_normalization,
+    )
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=False,
+        collate_fn=_data_loader._collate_fn,  # noqa: SLF001
+        num_workers=0,
     )
     frame_count = len(dataset)
     if args.max_frames is not None:
         frame_count = min(frame_count, args.max_frames)
 
-    # Build the runtime.
+    # Build the runtime (fails fast when no SEA-RAFT checkpoint is configured).
     runtime = flowpi_runtime.FlowPiRuntime(
         model,
         flow_config=flow_cfg,
@@ -58,17 +82,10 @@ def main():
     timing = {"raft_ms": [], "nfe_ms": [], "prefill_ms": []}
     all_actions = []
 
-    for frame_idx in range(frame_count):
-        raw = dataset[frame_idx]
-        # Repack into the common format using the same transforms as training (skip normalization).
-        sample = raw
-        for transform in data_config.repack_transforms.inputs:
-            sample = transform(sample)
-        for transform in data_config.data_transforms.inputs:
-            sample = transform(sample)
-
-        # Build an Observation.
-        obs = _model.Observation.from_dict(sample)
+    for frame_idx, batch in enumerate(loader):
+        if frame_idx >= frame_count:
+            break
+        obs = _model.Observation.from_dict(batch)
 
         if frame_idx == 0:
             # First frame: warm start + initial prefix refresh.

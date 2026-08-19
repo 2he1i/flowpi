@@ -511,18 +511,23 @@ class ComputeFlow(DataTransformFn):
 
 
 class DelaySlowImage(DataTransformFn):
-    """Samples a slow-channel VLM delay `d_vlm ~ U{0..vlm_delay_max}` and selects the corresponding
-    delayed frame from the stacked camera history as the (single) prefix image.
+    """Samples a slow-channel VLM delay `d_vlm ~ U{0..min(vlm_delay_max, frame_index)}` and selects
+    the corresponding delayed frame from the stacked camera history as the (single) prefix image.
 
     Must run *before* the robot-specific inputs transform (e.g. `AlohaInputs`), while the images are
     still stacked `[T, 3, H, W]` in `frame_offsets` order. When images are already single frames
     (no history loaded), sets `data["vlm_delay"] = 0` and does nothing else.
+
+    The delay is drawn from a per-instance RNG stream (not a per-sample hash): like the online
+    runtime, each sample and each epoch sees a fresh delay, and the sampled delay never exceeds the
+    frame index (a runtime refresh can never reach further back than the episode start).
     """
 
     def __init__(self, vlm_delay_max: int, frame_offsets: tuple[int, ...], *, seed: int = 0):
         self.vlm_delay_max = vlm_delay_max
         self.frame_offsets = tuple(frame_offsets)
         self.seed = seed
+        self._rng = np.random.default_rng(seed)
 
     def __call__(self, data: DataDict) -> DataDict:
         images = data.get("images", {})
@@ -531,10 +536,9 @@ class DelaySlowImage(DataTransformFn):
             data["vlm_delay"] = 0
             return data
 
-        episode_index = int(np.asarray(data["episode_index"]).item())
         frame_index = int(np.asarray(data["frame_index"]).item())
-        rng = np.random.default_rng(self.seed * 1_000_003 + episode_index * 100_003 + frame_index)
-        d_vlm = int(rng.integers(0, self.vlm_delay_max + 1))
+        max_d = min(self.vlm_delay_max, max(frame_index, 0))
+        d_vlm = int(self._rng.integers(0, max_d + 1))
 
         idx = frame_offset_index(self.frame_offsets, -d_vlm) if d_vlm > 0 else frame_offset_index(self.frame_offsets, 0)
         data["images"] = {cam: np.asarray(stack)[idx] for cam, stack in images.items()}

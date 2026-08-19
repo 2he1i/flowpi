@@ -59,8 +59,9 @@ class SeaRaftFlowExtractor:
     """Wraps a frozen SEA-RAFT (Tartan-M by default) model with a numpy interface.
 
     Args:
-        ckpt_path: Path to fine-tuned SEA-RAFT weights (.pt). If None, random weights are used
-            (only suitable for tests and smoke runs).
+        ckpt_path: Path to fine-tuned SEA-RAFT weights (.pt). If None, random weights are used.
+        allow_random_init: If False (default), raise when `ckpt_path` is None. Set to True only
+            for tests and smoke runs where random weights are acceptable.
         variant: Model variant ("S" | "M" | "L"). The user's fine-tuned weights use "M".
         device: Torch device for inference.
         iters: Number of refinement iterations (default from the variant config).
@@ -72,6 +73,8 @@ class SeaRaftFlowExtractor:
         variant: str = "M",
         device: str = "cpu",
         iters: int | None = None,
+        *,
+        allow_random_init: bool = False,
     ):
         if variant not in _VARIANT_CONFIGS:
             raise ValueError(f"Unknown SEA-RAFT variant: {variant}. Choose from {list(_VARIANT_CONFIGS)}")
@@ -87,9 +90,14 @@ class SeaRaftFlowExtractor:
         self._device = torch.device(device)
 
         raft_cls = _import_raft()
-        # Deterministic random init when no checkpoint is given, so that separate processes
-        # (cache precomputation vs. online testing) produce comparable flows.
+        # Random init when no checkpoint is given. Random weights produce garbage flow, so this
+        # must be an explicit opt-in (tests/smoke runs only), and is seeded for reproducibility.
         if ckpt_path is None:
+            if not allow_random_init:
+                raise ValueError(
+                    "SEA-RAFT would run with random weights: `ckpt_path` is None. Pass a checkpoint, "
+                    "or set allow_random_init=True for tests/smoke runs."
+                )
             torch.manual_seed(0)
         self._model = raft_cls(args).to(self._device).eval()
         for p in self._model.parameters():

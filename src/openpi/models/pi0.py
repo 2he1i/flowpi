@@ -142,13 +142,6 @@ class Pi0(_model.BaseModel):
             )
             # Fresh-state fast channel: state token re-encoded into the suffix at every NFE.
             self.flow_state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
-            # Slow-channel delay embedding (zeros init: purely additive, exact no-op at start).
-            self.flow_vlm_delay = nnx.Embed(
-                num_embeddings=flow_cfg.vlm_delay_max + 1,
-                features=paligemma_config.width,
-                embedding_init=nnx.initializers.zeros_init(),
-                rngs=rngs,
-            )
             # Fast-channel delay embedding for the AE adaRMS conditioning (zeros init: the fast
             # Action Expert is an exact no-op w.r.t. delay until trained).
             self.flow_vlm_delay_fast = nnx.Embed(
@@ -178,11 +171,6 @@ class Pi0(_model.BaseModel):
         # embed images
         for name in obs.images:
             image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
-
-            # flowpi: slow-channel delay embedding (zeros init => exact no-op when unused).
-            vlm_delay = self._vlm_delay(obs)
-            if vlm_delay is not None:
-                image_tokens = image_tokens + self.flow_vlm_delay(vlm_delay)[:, None, :]
 
             tokens.append(image_tokens)
             input_mask.append(
@@ -549,12 +537,15 @@ class Pi0(_model.BaseModel):
         batch_size = observation.state.shape[0]
         horizon = self.action_horizon
 
-        clean = self.sample_actions(rng, observation, num_steps=num_steps, noise=noise)
+        # Split the RNG so the initial denoising noise and the re-noise noise are independent
+        # streams (reusing the same key would correlate the warm-start noise and the streaming
+        # tail noise).
+        sample_rng, renoise_rng = jax.random.split(rng)
+        clean = self.sample_actions(sample_rng, observation, num_steps=num_steps, noise=noise)
 
         # Prefill the prefix KV cache (age 0).
         kv_cache, prefix_mask = self._prefix_forward(observation)
 
-        renoise_rng, _ = jax.random.split(rng)
         eps = jax.random.normal(renoise_rng, clean.shape)
         tau = make_staircase_tau(horizon, d)[None, :].repeat(batch_size, axis=0)  # [B, H]
         x = tau[..., None] * eps + (1 - tau[..., None]) * clean

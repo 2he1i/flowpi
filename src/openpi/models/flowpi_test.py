@@ -14,6 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import pytest
 
 import openpi.models.model as _model
 import openpi.models.pi0 as _pi0
@@ -502,3 +503,27 @@ def test_streaming_runtime():
 
     refreshed = model.refresh_prefix(state, obs)
     assert int(refreshed.prefix_age[0]) == 0
+
+
+def test_flow_config_validation():
+    """Invalid FlowConfig parameters must be rejected at construction time."""
+    invalid = (
+        {"num_flow_steps": 0},
+        {"flow_stride_frames": 0},
+        {"flow_scale": 0.0},
+        {"p_standard": 1.5},
+        {"p_standard": -0.1},
+        {"tau_jitter": 1.0},
+        {"vlm_delay_max": -1},
+        {"d_max": 0},
+        {"injection_layers": (1, 1)},
+        {"injection_layers": (-1, 2)},
+        {"flow_image_size": (480, 641)},
+        {"num_cross_heads": 0},
+    )
+    for kwargs in invalid:
+        with pytest.raises(ValueError, match="must be|must have|flow_image_size"):
+            _pi0_config.FlowConfig(**kwargs)
+    # A valid config (and defaults) construct fine.
+    _pi0_config.FlowConfig()
+    _pi0_config.FlowConfig(injection_layers=(1, 3))

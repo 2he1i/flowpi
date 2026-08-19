@@ -8,7 +8,7 @@ pytestmark = pytest.mark.slow
 def extractor():
     from openpi.training.sea_raft import SeaRaftFlowExtractor
 
-    return SeaRaftFlowExtractor(ckpt_path=None, variant="M", device="cpu")
+    return SeaRaftFlowExtractor(ckpt_path=None, variant="M", device="cpu", allow_random_init=True)
 
 
 @pytest.mark.parametrize(("batch", "n_cam"), [(1, 3)])

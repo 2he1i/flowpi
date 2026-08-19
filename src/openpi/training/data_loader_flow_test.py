@@ -55,6 +55,7 @@ def _make_train_config(mode: str, vlm_delay_max: int, flow_cache_dir: str | None
             flow_cache_dir=flow_cache_dir,
             sea_raft_ckpt=None,
             sea_raft_device=_DEVICE,
+            sea_raft_allow_random_init=True,
         ),
     )
     return _config.TrainConfig(
@@ -149,19 +150,26 @@ def test_delay_slow_image_selection():
     images = {f"cam_{i}": np.arange(t_stack * h * w * 3, dtype=np.uint8).reshape(t_stack, 3, h, w) for i in range(2)}
     data = {"images": {k: v.copy() for k, v in images.items()}, "episode_index": 0, "frame_index": 13}
 
-    out = transform(dict(data))
-    d = out["vlm_delay"]
-    assert 0 <= d <= 4
-    expected_index = frame_offsets.index(-d)
-    for cam in out["images"]:
-        np.testing.assert_array_equal(out["images"][cam], images[cam][expected_index])
-        assert out["images"][cam].shape == (3, h, w)
+    # Stochastic sampling: one transform instance draws a fresh delay per call, and every drawn
+    # delay selects the matching stacked frame.
+    delays = set()
+    for _ in range(64):
+        out = transform(dict(data))
+        d = out["vlm_delay"]
+        assert 0 <= d <= 4
+        expected_index = frame_offsets.index(-d)
+        for cam in out["images"]:
+            np.testing.assert_array_equal(out["images"][cam], images[cam][expected_index])
+            assert out["images"][cam].shape == (3, h, w)
+        delays.add(int(d))
+    assert len(delays) >= 3, f"expected varied delays over 64 draws, got {sorted(delays)}"
 
-    # Deterministic: same sample -> same selection.
-    out2 = transform(dict(data))
-    assert out2["vlm_delay"] == d
-    for cam in out2["images"]:
-        np.testing.assert_array_equal(out2["images"][cam], out["images"][cam])
+    # Early in the episode the delay can never reach further back than the frame index.
+    early_transform = _transforms.DelaySlowImage(4, frame_offsets, seed=3)
+    early_data = {"images": {k: v.copy() for k, v in images.items()}, "episode_index": 0, "frame_index": 2}
+    for _ in range(64):
+        out = early_transform(dict(early_data))
+        assert 0 <= out["vlm_delay"] <= 2
 
     # vlm_delay_max=0 with unstacked (single-frame) images is a no-op.
     no_delay = _transforms.DelaySlowImage(0, (0,))

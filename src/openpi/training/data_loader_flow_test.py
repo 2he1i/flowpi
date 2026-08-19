@@ -13,7 +13,7 @@ import openpi.transforms as _transforms
 
 pytestmark = pytest.mark.slow
 
-_TEST_DATA = pathlib.Path(__file__).resolve().parents[3] / "test_data" / "adjust_bottle_ep0"
+_TEST_DATA = pathlib.Path(__file__).resolve().parents[3] / "data" / "adjust_bottle_ep0"
 
 _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -118,6 +118,7 @@ def test_cache_roundtrip_matches_online(tmp_path):
         "flow_cache_dir": cache_dir,
         "sea_raft_ckpt": None,
         "sea_raft_device": _DEVICE,
+        "sea_raft_allow_random_init": True,
         "batch_size": 16,
         "verbose": False,
     }
@@ -195,3 +196,43 @@ def test_flow_disabled_matches_baseline():
     assert "frame_index" not in sample
     assert sample["image"]["base_0_rgb"].shape == (224, 224, 3)
     assert sample["actions"].shape == (50, 32)
+
+
+def test_load_flow_cache_lru_eviction(tmp_path):
+    """The open per-episode memmaps must be bounded by the LRU cache."""
+    import json
+
+    cache_dir = tmp_path / "flow_cache"
+    cache_dir.mkdir()
+    with open(cache_dir / "meta.json", "w") as f:
+        json.dump({"num_flow_steps": 2, "flow_stride_frames": 3, "image_size": [480, 640]}, f)
+    cams = ("cam_high", "cam_left_wrist", "cam_right_wrist")
+    for ep in range(3):
+        ep_dir = cache_dir / f"episode-{ep:06d}"
+        ep_dir.mkdir()
+        for cam in cams:
+            np.save(ep_dir / f"{cam}.npy", np.zeros((5, 2, 2, 60, 80), dtype=np.float16))
+        np.save(ep_dir / "valid.npy", np.ones((5, 2), dtype=bool))
+
+    transform = _transforms.LoadFlowCache(
+        str(cache_dir),
+        cams,
+        num_flow_steps=2,
+        flow_stride_frames=3,
+        flow_image_size=(480, 640),
+        flow_scale=20.0,
+        flow_clamp=8.0,
+        max_cached_episodes=2,
+    )
+
+    for ep in range(3):
+        out = transform({"episode_index": ep, "frame_index": 0, "images": {}})
+        assert "flow" in out
+        assert len(transform._mmaps) <= 2  # noqa: SLF001
+    # Episode 0 was evicted (LRU order: 1, 2).
+    assert list(transform._mmaps.keys()) == [1, 2]  # noqa: SLF001
+
+    # Re-accessing an evicted episode works and refreshes the recency order.
+    out = transform({"episode_index": 0, "frame_index": 0, "images": {}})
+    assert out["flow"]["cam_high"].shape == (2, 2, 60, 80)
+    assert list(transform._mmaps.keys()) == [2, 0]  # noqa: SLF001

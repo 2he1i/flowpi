@@ -7,7 +7,7 @@ DelaySlowImage) and the camera history loading are therefore NOT applied here.
 
 Usage:
     uv run python scripts/flowpi_infer.py --config-name flowpi_aloha \
-        --checkpoint /path/to/checkpoint --dataset test_data/adjust_bottle_ep0 \
+        --checkpoint /path/to/checkpoint --dataset data/adjust_bottle_ep0 \
         --slow-every-n 10
 """
 

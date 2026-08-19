@@ -1,3 +1,4 @@
+from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 import dataclasses
 import pathlib
@@ -377,6 +378,9 @@ class LoadFlowCache(DataTransformFn):
 
     Produces `data["flow"] = {cam_key: [K, 2, h, w]}` (normalized) and
     `data["flow_masks"] = {cam_key: [K]}` (per-lag validity).
+
+    Flow arrays are memory-mapped (never loaded whole into RAM); the open per-episode mappings
+    are bounded by an LRU so that long/many-episode datasets cannot exhaust file descriptors.
     """
 
     def __init__(
@@ -389,6 +393,7 @@ class LoadFlowCache(DataTransformFn):
         flow_image_size: tuple[int, int],
         flow_scale: float,
         flow_clamp: float,
+        max_cached_episodes: int = 8,
     ):
         self.flow_cache_dir = pathlib.Path(flow_cache_dir)
         self.cam_keys = tuple(cam_keys)
@@ -397,8 +402,10 @@ class LoadFlowCache(DataTransformFn):
         self.flow_image_size = tuple(flow_image_size)
         self.flow_scale = flow_scale
         self.flow_clamp = flow_clamp
+        self._max_cached = max(1, max_cached_episodes)
         self._validate_meta()
-        self._mmaps: dict[int, tuple[dict[str, np.ndarray], np.ndarray]] = {}
+        # OrderedDict doubles as the LRU: hits move the key to the end, eviction drops the front.
+        self._mmaps: OrderedDict[int, tuple[dict[str, np.ndarray], np.ndarray]] = OrderedDict()
 
     def _validate_meta(self) -> None:
         import json
@@ -424,12 +431,19 @@ class LoadFlowCache(DataTransformFn):
 
     def _episode(self, episode_index: int) -> tuple[dict[str, np.ndarray], np.ndarray]:
         cached = self._mmaps.get(episode_index)
-        if cached is None:
-            ep_dir = self.flow_cache_dir / f"episode-{episode_index:06d}"
-            flows = {cam: np.load(ep_dir / f"{cam}.npy", mmap_mode="r") for cam in self.cam_keys}
-            valid = np.load(ep_dir / "valid.npy")
-            cached = (flows, valid)
-            self._mmaps[episode_index] = cached
+        if cached is not None:
+            # LRU hit: refresh the recency order.
+            self._mmaps.move_to_end(episode_index)
+            return cached
+        ep_dir = self.flow_cache_dir / f"episode-{episode_index:06d}"
+        flows = {cam: np.load(ep_dir / f"{cam}.npy", mmap_mode="r") for cam in self.cam_keys}
+        valid = np.load(ep_dir / "valid.npy")
+        cached = (flows, valid)
+        self._mmaps[episode_index] = cached
+        while len(self._mmaps) > self._max_cached:
+            # Dropping the entry releases the memmap file handles (the arrays are never fully
+            # loaded into memory, so eviction is cheap).
+            self._mmaps.popitem(last=False)
         return cached
 
     def __call__(self, data: DataDict) -> DataDict:

@@ -1,7 +1,7 @@
 """Minimal read-only LeRobot v3.0 dataset loader.
 
 The `lerobot` package pinned by openpi (0.1.0, codebase v2.1) cannot read v3.0 datasets
-(e.g. `test_data/adjust_bottle_ep0`: parquet-embedded PNG images, `meta/tasks.parquet`,
+(e.g. `data/adjust_bottle_ep0`: parquet-embedded PNG images, `meta/tasks.parquet`,
 `meta/episodes/chunk-*/file-*.parquet`). This module implements the small subset of the
 `LeRobotDataset` interface that openpi's data pipeline needs:
 

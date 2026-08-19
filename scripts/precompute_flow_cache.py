@@ -89,7 +89,10 @@ def _process_episode(task: dict) -> dict:
     from openpi.training.sea_raft import SeaRaftFlowExtractor
 
     extractor = SeaRaftFlowExtractor(
-        ckpt_path=task["sea_raft_ckpt"] or None, variant="M", device=task["sea_raft_device"]
+        ckpt_path=task["sea_raft_ckpt"] or None,
+        variant="M",
+        device=task["sea_raft_device"],
+        allow_random_init=task.get("sea_raft_allow_random_init", False),
     )
     root = pathlib.Path(task["root"])
     entry = task["entry"]
@@ -181,6 +184,7 @@ def main():
             "flow_cache_dir": str(cache_dir),
             "sea_raft_ckpt": flow_cfg.sea_raft_ckpt,
             "sea_raft_device": flow_cfg.sea_raft_device,
+            "sea_raft_allow_random_init": flow_cfg.sea_raft_allow_random_init,
             "batch_size": 16,
             "verbose": extra.num_workers <= 1,
         }

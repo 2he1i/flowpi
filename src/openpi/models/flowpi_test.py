@@ -426,7 +426,8 @@ def test_prefix_refresh_swaps_kv_and_resets_age():
     assert int(state.prefix_age[0]) == 1
     np.testing.assert_array_equal(np.asarray(state.prefix_mask), mask_old)
     assert all(
-        np.array_equal(np.asarray(a), np.asarray(b)) for a, b in zip(jax.tree.leaves(state.kv_cache), kv_old, strict=True)
+        np.array_equal(np.asarray(a), np.asarray(b))
+        for a, b in zip(jax.tree.leaves(state.kv_cache), kv_old, strict=True)
     )
 
     # Refresh: new KV + matching mask + age reset; the action buffer is untouched.

@@ -125,7 +125,9 @@ def _run_runtime_test(sea_raft_device="cpu"):
         # KV cache changed and the age restarted from the installation tick.
         if kv_before_refresh is not None:
             kv_now = jax.tree.leaves(runtime._streaming_state.kv_cache)  # noqa: SLF001
-            changed = any(np.any(np.asarray(a) != np.asarray(b)) for a, b in zip(kv_now, kv_before_refresh, strict=True))
+            changed = any(
+                np.any(np.asarray(a) != np.asarray(b)) for a, b in zip(kv_now, kv_before_refresh, strict=True)
+            )
             assert changed, f"tick {i}: refresh result was not installed into the streaming state"
             assert age == 1, f"tick {i}: age {age} != 1 right after a prefix swap"
             kv_before_refresh = None

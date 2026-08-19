@@ -44,6 +44,7 @@ def _make_train_config(mode: str, vlm_delay_max: int, flow_cache_dir: str | None
             num_flow_steps=2,
             flow_stride_frames=3,
             vlm_delay_max=vlm_delay_max,
+            injection_layers=(1, 2),  # dummy action expert has depth 4
         ),
     )
     data = _config.LeRobotAlohaDataConfig(

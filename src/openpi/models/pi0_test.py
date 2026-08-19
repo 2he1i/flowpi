@@ -12,9 +12,13 @@ def _get_frozen_state(config: _pi0_config.Pi0Config) -> nnx.State:
 
 
 def test_pi0_full_finetune():
-    """The baseline pi0 also freezes the SigLIP vision tower (frozen-vision policy, matching the
-    flowpi config)."""
+    """Upstream default: with no LoRA and no explicit freeze, nothing is frozen. The flowpi
+    frozen-vision policy opts in via `freeze_vision_encoder`, which freezes the SigLIP tower."""
     config = _pi0_config.Pi0Config()
+    state = _get_frozen_state(config)
+    assert len(state) == 0
+
+    config = _pi0_config.Pi0Config(freeze_vision_encoder=True)
     state = _get_frozen_state(config)
     assert len(state) > 0
     assert all(p[:2] == ("PaliGemma", "img") for p in state)

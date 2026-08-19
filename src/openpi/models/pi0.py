@@ -155,9 +155,15 @@ class Pi0(_model.BaseModel):
         self.deterministic = True
 
     def _vlm_delay(self, obs: _model.Observation) -> jax.Array | None:
-        """Slow-channel delay, clamped to ``vlm_delay_max`` so the embedding lookup can never go
-        out of range (any staleness beyond the trained maximum maps to the max-delay embedding)."""
-        if self.flow_config is None or obs.vlm_delay is None:
+        """Fast-channel delay conditioning for the action expert's adaRMS.
+
+        The delay is the staleness of the *cached* slow prefix (current tick minus the tick of
+        the observation the active prefix was computed from, including the VLM compute latency).
+        It is set by the streaming runtime on ``obs.vlm_delay`` and clamped here to
+        ``vlm_delay_max`` so the embedding lookup can never go out of range (any staleness
+        beyond the trained maximum maps to the max-delay embedding).
+        """
+        if self.flow_config is None or not self.flow_config.use_delay or obs.vlm_delay is None:
             return None
         return jnp.minimum(obs.vlm_delay, self.flow_config.vlm_delay_max)
 
@@ -255,7 +261,7 @@ class Pi0(_model.BaseModel):
             action_time_tokens = nnx.swish(action_time_tokens)
             action_expert_tokens = action_time_tokens
 
-        if self.pi05 and self.flow_config is not None:
+        if self.pi05 and self.flow_config is not None and self.flow_config.use_fresh_state:
             # flowpi fresh-state fast channel: prepend a state token to the suffix (re-encoded at
             # every NFE) and give the adaRMS cond for it the t=0 embedding (it is a conditioning
             # token, not a denoising target).
@@ -293,8 +299,13 @@ class Pi0(_model.BaseModel):
         self, obs: _model.Observation
     ) -> tuple[at.Float[at.Array, "b f emb"], at.Bool[at.Array, "b f"]] | None:
         """Tokenizes the (normalized) optical flow into cross-attention tokens. Returns None when
-        the flow fast-path is disabled or the observation carries no flow."""
-        if self.flow_config is None or obs.flow is None:
+        the flow fast-path is disabled (``use_flow=False`` ablation), the observation carries no
+        flow, or flow is not configured.
+
+        Note: when the flowpi architecture exists but no flow tokens are produced, the gemma
+        module substitutes an all-invalid dummy flow, which makes the gated cross-attention
+        exactly zero (identity) instead of injecting learned attention over a dummy token."""
+        if self.flow_config is None or not self.flow_config.use_flow or obs.flow is None:
             return None
         return self.flow_tokenizer(obs.flow, obs.flow_masks or dict.fromkeys(obs.flow))
 
@@ -309,7 +320,7 @@ class Pi0(_model.BaseModel):
         noise = jax.random.normal(noise_rng, actions.shape)
         horizon = self.action_horizon
 
-        if self.flow_config is not None and self.pi05:
+        if self.flow_config is not None and self.pi05 and self.flow_config.use_pir2:
             # πR² training: per-batch-element mix of staircase samples (p_pir2) and standard
             # scalar-time FM samples (p_standard), vectorized with per-row masks.
             cfg = self.flow_config
@@ -381,7 +392,7 @@ class Pi0(_model.BaseModel):
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
         sq = jnp.square(v_t - u_t)
-        if self.flow_config is not None and self.pi05:
+        if self.flow_config is not None and self.pi05 and self.flow_config.use_pir2:
             # Renormalize valid positions so the outer mean matches the baseline π0.5 loss scale.
             valid_count = jnp.maximum(jnp.sum(loss_mask, axis=-1, keepdims=True), 1.0)
             return jnp.mean(sq, axis=-1) * loss_mask * (horizon / valid_count)
@@ -485,8 +496,12 @@ class Pi0(_model.BaseModel):
         prefix_mask: jax.Array
         # Prefix token count per batch element.
         prefix_len: jax.Array | None = None
-        # Ticks elapsed since the last prefix refresh (for the d_vlm delay embedding).
-        prefix_age: jax.Array | None = None
+        # Episode-relative tick of the observation the active prefix was computed from. The slow
+        # channel delay is `current_tick - prefix_source_tick` (it includes the VLM compute
+        # latency), computed by the streaming runtime; the model methods only carry the value
+        # through. Set by `warm_start` to 0 (the prefix comes from the episode-start observation)
+        # and by the runtime when it installs a new prefix generation.
+        prefix_source_tick: jax.Array | None = None
 
     def _prefix_forward(self, observation: _model.Observation):
         """Runs the prefix (slow channel) once and returns (kv_cache, prefix_mask)."""
@@ -557,7 +572,7 @@ class Pi0(_model.BaseModel):
             tau=tau,
             kv_cache=kv_cache,
             prefix_mask=prefix_mask,
-            prefix_age=jnp.zeros((batch_size,), dtype=jnp.int32),
+            prefix_source_tick=jnp.zeros((batch_size,), dtype=jnp.int32),
         )
 
     def denoise_step(
@@ -617,20 +632,24 @@ class Pi0(_model.BaseModel):
             tau=tau_next,
             kv_cache=state.kv_cache,
             prefix_mask=state.prefix_mask,
-            prefix_age=(state.prefix_age + 1) if state.prefix_age is not None else None,
+            prefix_source_tick=state.prefix_source_tick,
         )
         return emit, new_state
 
     def refresh_prefix(self, state: StreamingState, observation: _model.Observation) -> StreamingState:
-        """Slow-channel refresh: re-run the prefix with the latest observation; reset the age."""
+        """Slow-channel refresh: re-run the prefix with the latest observation.
+
+        The prefix source tick is NOT touched here: the caller (streaming runtime) records the
+        tick of the observation this prefix was computed from and installs it together with the
+        new KV cache, so the delay stays `current_tick - prefix_source_tick`.
+        """
         assert self.flow_config is not None, "refresh_prefix requires the flowpi configuration"
         observation = _model.preprocess_observation(None, observation, train=False)
         kv_cache, prefix_mask = self._prefix_forward(observation)
-        batch_size = observation.state.shape[0]
         return self.StreamingState(
             action_buffer=state.action_buffer,
             tau=state.tau,
             kv_cache=kv_cache,
             prefix_mask=prefix_mask,
-            prefix_age=jnp.zeros((batch_size,), dtype=jnp.int32),
+            prefix_source_tick=state.prefix_source_tick,
         )

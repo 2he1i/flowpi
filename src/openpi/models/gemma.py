@@ -528,12 +528,16 @@ class Module(nn.Module):
             flow_slot = self._make_flow_slot()
             flow_params = self._make_flow_params()
             if flow is None:
+                # No flow tokens (e.g. `use_flow=False` ablation, or an observation without
+                # flow). Substitute a dummy token with an *all-invalid* mask so the gated
+                # cross-attention output is exactly zero (identity) and the flow branch receives
+                # no gradient — never learned attention over a dummy token.
                 batch_size = next(e.shape[0] for e in embedded if e is not None)
                 flow = jnp.zeros(
                     (batch_size, 1, self.configs[1].width),
                     dtype=jnp.dtype(self.embed_dtype) if isinstance(self.embed_dtype, str) else self.embed_dtype,
                 )
-                flow_mask = jnp.ones((batch_size, 1), dtype=jnp.bool_)
+                flow_mask = jnp.zeros((batch_size, 1), dtype=jnp.bool_)
         else:
             flow_slot = jnp.full((self.configs[0].depth,), -1, dtype=jnp.int32)
             flow_params = None

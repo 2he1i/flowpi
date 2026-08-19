@@ -4,13 +4,16 @@ import asyncio
 import concurrent.futures as futures
 import dataclasses
 import logging
+import pathlib
 from typing import Protocol
 
 from etils import epath
 import jax
+import jax.numpy as jnp
 import orbax.checkpoint as ocp
 import orbax.checkpoint.future as future
 
+from openpi.models import model as _model
 from openpi.shared import array_typing as at
 import openpi.shared.normalize as _normalize
 import openpi.training.data_loader as _data_loader
@@ -105,6 +108,56 @@ def restore_state(
             },
         )
     return _merge_params(restored["train_state"], restored["params"])
+
+
+def _resolve_checkpoint_path(checkpoint_path: str) -> str:
+    """Normalize a checkpoint path to a restoreable params directory.
+
+    Accepts (in order of preference):
+    - a released checkpoint (e.g. ``gs://.../pi05_base/params`` or ``.../params``),
+    - an orbax training step directory (``<dir>/step_000123``),
+    - a training checkpoint root with a ``latest`` symlink (``<dir>/latest -> step_...``),
+    - a step directory's ``params`` item (``<dir>/step_000123/params``).
+    """
+    if str(checkpoint_path).startswith("gs://"):
+        return str(checkpoint_path)
+    path = pathlib.Path(checkpoint_path)
+    candidates = [path]
+    latest = path / "latest"
+    if latest.is_symlink():
+        candidates.append(latest.resolve())
+    candidates.append(path / "params")
+    for candidate in candidates:
+        if (candidate / "metadata.json").exists():
+            return str(candidate)
+    # No metadata found; let `restore_params` raise the precise error.
+    return str(path)
+
+
+def load_model_from_checkpoint(
+    model_config: _model.BaseModelConfig,
+    checkpoint_path: str,
+    *,
+    dtype: jnp.dtype | None = None,
+) -> _model.BaseModel:
+    """Create a model with parameters restored from an openpi checkpoint.
+
+    This is the single entry point for replay / serving / eval. It restores the params and
+    verifies (via the model-config equality check) that the checkpoint contains exactly the
+    model's parameters — a checkpoint without the flowpi weights (e.g. a plain π0.5 checkpoint)
+    fails loudly instead of silently running with random weights.
+
+    Args:
+        model_config: The model config (e.g. ``train_config.model``).
+        checkpoint_path: Path to a released checkpoint, an orbax step directory, or a training
+            checkpoint root with a ``latest`` symlink.
+        dtype: Optional dtype override for the restored params.
+
+    Returns:
+        The model with restored parameters.
+    """
+    params = _model.restore_params(_resolve_checkpoint_path(checkpoint_path), dtype=dtype)
+    return model_config.load(params)
 
 
 def load_norm_stats(assets_dir: epath.Path | str, asset_id: str) -> dict[str, _normalize.NormStats] | None:

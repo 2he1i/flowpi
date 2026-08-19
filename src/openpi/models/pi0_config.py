@@ -41,6 +41,15 @@ class FlowConfig:
     tau_jitter: float = 0.01
     # Slow channel delay.
     vlm_delay_max: int = 10
+    # Ablation toggles. These gate the *use* of a channel in the forward pass but never the
+    # parameter layout: the flow modules are always created when `enabled`, so every flowpi
+    # configuration (including ablations) shares one architecture and can load the same
+    # checkpoint. A channel that is switched off receives no gradient and stays exactly at its
+    # initialization.
+    use_fresh_state: bool = True  # flow_state_proj state token in the suffix at every NFE.
+    use_delay: bool = True  # flow_vlm_delay_fast adaRMS conditioning.
+    use_flow: bool = True  # flow tokenizer + FlowGeom cross-attention.
+    use_pir2: bool = True  # πR² staircase noise; False falls back to baseline β(t) noise.
 
     def __post_init__(self):
         if self.injection_layers is None:
@@ -51,6 +60,14 @@ class FlowConfig:
             raise ValueError(f"flow_stride_frames must be positive, got {self.flow_stride_frames}")
         if self.flow_scale <= 0:
             raise ValueError(f"flow_scale must be positive, got {self.flow_scale}")
+        if self.flow_clamp <= 0:
+            raise ValueError(f"flow_clamp must be positive, got {self.flow_clamp}")
+        if not self.tokenizer_channels:
+            raise ValueError("tokenizer_channels must be non-empty")
+        if any(c <= 0 for c in self.tokenizer_channels):
+            raise ValueError(f"tokenizer_channels must be positive, got {self.tokenizer_channels}")
+        if self.tokenizer_mlp_hidden <= 0:
+            raise ValueError(f"tokenizer_mlp_hidden must be positive, got {self.tokenizer_mlp_hidden}")
         if not 0.0 <= self.p_standard <= 1.0:
             raise ValueError(f"p_standard must be in [0, 1], got {self.p_standard}")
         if not 0.0 <= self.tau_jitter < 1.0:
@@ -93,6 +110,11 @@ class Pi0Config(_model.BaseModelConfig):
     # None (default) keeps the model graph identical to the baseline π0.5.
     flow: FlowConfig | None = None
 
+    # Freeze the SigLIP vision tower. Upstream default (False) trains everything; the flowpi
+    # configs opt in explicitly so the frozen-vision policy stays an experiment decision and
+    # baseline π0.5 configs keep upstream semantics.
+    freeze_vision_encoder: bool = False
+
     pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):
@@ -111,6 +133,11 @@ class Pi0Config(_model.BaseModelConfig):
             assert (
                 self.flow.d_max < self.action_horizon / 2
             ), f"flow.d_max ({self.flow.d_max}) must be < action_horizon/2 ({self.action_horizon / 2})"
+            depth = _gemma.get_config(self.action_expert_variant).depth
+            for layer in self.flow.injection_layers:
+                assert (
+                    0 <= layer < depth
+                ), f"flow injection layer {layer} is out of range for action expert depth {depth}"
 
     @property
     @override
@@ -201,9 +228,10 @@ class Pi0Config(_model.BaseModelConfig):
                 nnx.Not(nnx_utils.PathRegex(".*lora.*")),
             )
         if not filters:
-            # With no LoRA, freeze only the SigLIP vision tower for both the baseline and the
-            # flowpi model (frozen-vision policy; VLM transformer / action expert / flow branch
-            # are fully trainable). flowpi additionally keeps SEA-RAFT frozen outside the JAX
-            # parameter tree.
-            return nnx_utils.PathRegex(r"PaliGemma/img.*")
+            # With no LoRA the upstream default is to train everything. The flowpi frozen-vision
+            # policy opts in via `freeze_vision_encoder` (flowpi additionally keeps SEA-RAFT
+            # frozen outside the JAX parameter tree).
+            if self.freeze_vision_encoder:
+                return nnx_utils.PathRegex("PaliGemma/img.*")
+            return nnx.Nothing
         return nnx.All(*filters)

@@ -174,7 +174,9 @@ def preprocess_observation(
     for key in image_keys:
         image = observation.images[key]
         if image.shape[1:3] != image_resolution:
-            logger.info(f"Resizing image {key} from {image.shape[1:3]} to {image_resolution}")
+            # Fires on every runtime tick when the streaming runtime feeds full-resolution
+            # frames (the flow fast path needs them for SEA-RAFT); keep it at debug level.
+            logger.debug(f"Resizing image {key} from {image.shape[1:3]} to {image_resolution}")
             image = image_tools.resize_with_pad(image, *image_resolution)
 
         if train:

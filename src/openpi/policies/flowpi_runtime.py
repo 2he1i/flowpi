@@ -1,8 +1,11 @@
-"""FlowPi runtime: frame ring buffer, per-tick optical flow, background prefix refresh, and the πR² streaming loop."""
+"""FlowPi runtime: frame ring buffer, per-tick optical flow, async prefix refresh, and the πR² streaming loop."""
 
 from collections.abc import Sequence
+from concurrent.futures import Future
+from concurrent.futures import ThreadPoolExecutor
 import dataclasses
 import threading
+import time
 from typing import Any
 
 import jax
@@ -14,6 +17,24 @@ from openpi.models import pi0 as _pi0
 from openpi.training.sea_raft import SeaRaftFlowExtractor
 from openpi.transforms import compute_image_frame_offsets
 from openpi.transforms import normalize_flow
+
+
+@dataclasses.dataclass
+class PrefixGeneration:
+    """A completed slow-channel prefix prefill, published for atomic installation.
+
+    ``episode_id`` and ``source_tick`` let the runtime drop stale generations: a prefill from a
+    previous episode, or one computed from a frame older than the currently active prefix, is
+    never installed.
+    """
+
+    # Episode this prefix was computed in (drops cross-episode publications).
+    episode_id: int
+    # Episode-relative tick of the observation this prefix was computed from. The slow delay is
+    # `current_tick - source_tick` (includes the VLM compute latency).
+    source_tick: int
+    kv_cache: Any
+    prefix_mask: jax.Array
 
 
 class _FrameRingBuffer:
@@ -76,17 +97,26 @@ class _FrameRingBuffer:
 class FlowPiRuntime:
     """Offline-replay / online-deployment runtime for a flowpi model.
 
+    The runtime expects full-resolution camera frames (the ``flow_image_size`` used at training
+    time, e.g. 480x640): it computes the online SEA-RAFT flow on those frames and lets the model
+    preprocess the same observation for the VLM (resizing internally). Feeding pre-resized
+    (model-resolution) frames produces a wrong flow grid and raises.
+
     Usage (offline replay on a dataset episode, 50 Hz, d=1 per tick)::
 
         runtime = FlowPiRuntime(model, flow_config=..., sea_raft_ckpt=..., device="cuda")
         runtime.warm_start(first_observation)
-        runtime.refresh_prefix(first_observation)   # initial slow-channel fill
+        runtime.refresh_prefix(first_observation, wait=True)   # initial slow-channel fill
         for frame_idx in range(1, episode_length):
             obs = dataset[frame_idx]                # (Observation state, images)
             actions = runtime.tick(obs)
             if frame_idx % slow_every_n == 0:
-                runtime.refresh_prefix(obs)
+                runtime.refresh_prefix(obs)         # async: returns immediately
             # use actions ...
+        runtime.close()                             # drain the slow worker, propagate errors
+
+    The slow delay is `current_tick - prefix_source_tick`: the tick of the observation the
+    active prefix was computed from, so it includes the VLM compute latency.
     """
 
     def __init__(
@@ -120,20 +150,44 @@ class FlowPiRuntime:
         )
 
         # Slow-channel publication: a completed background prefix refresh is published here
-        # atomically (kv_cache + prefix_mask as one consistent tuple) and installed into the
-        # active StreamingState at the start of the next fast tick.
-        self._pending_prefix: tuple[Any, Any] | None = None
+        # atomically (kv_cache + prefix_mask + source metadata as one consistent object) and
+        # installed into the active StreamingState at the start of the next fast tick.
+        self._pending_prefix: PrefixGeneration | None = None
         self._slow_lock = threading.Lock()
+        # Single slow worker: VLM prefills run serially, so a newer refresh always supersedes an
+        # older one (only the latest generation is ever published).
+        self._slow_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="flowpi-slow")
+        self._slow_futures: list[Future] = []
+        # Generation of the most recently submitted refresh; in-flight jobs whose generation is
+        # no longer the latest drop their result.
+        self._slow_latest_gen = 0
 
-        # Per-episode streaming state. `StreamingState.prefix_age` is the single authoritative
-        # clock for the age of the prefix actually used by the fast policy.
+        # Per-episode streaming state. `StreamingState.prefix_source_tick` (mirrored by
+        # `self._prefix_source_tick`) is the single authoritative clock for the age of the
+        # prefix actually used by the fast policy.
         self._streaming_state: _pi0.Pi0.StreamingState | None = None
         self._ring: _FrameRingBuffer | None = None
-        self._tick = 0  # monotonically increasing per-tick counter (RNG only, not a prefix clock)
+        # Monotonically increasing per-tick counter (RNG only, not a prefix clock).
+        self._tick = 0
+        self._episode_id = 0
+        # Episode-relative index of the most recently ingested frame (0 = the warm-start frame).
+        self._frame_index = 0
+        # Episode-relative tick of the observation the active prefix was computed from.
+        self._prefix_source_tick: int | None = None
 
         # Image resolution for flow (480x640 -> 60x80 grid).
         h, w = flow_config.flow_image_size
         self._flow_grid = (h // 8, w // 8)
+
+        # Telemetry (wall-clock ms and delays; appended from the main thread and the slow worker).
+        self.stats: dict[str, list[float]] = {
+            "flow_ms": [],
+            "prefill_ms": [],
+            "tick_total_ms": [],
+            "prefix_age_at_install": [],
+        }
+        # Published-but-never-installed prefix generations (stale episode or out-of-order tick).
+        self.num_generation_drops: int = 0
 
     # ---- ring buffer -----------------------------------------------------------
 
@@ -184,8 +238,17 @@ class FlowPiRuntime:
         )[None]  # [1, K*n_cam, 3, H, W]
         prev_stacked = np.concatenate(prev_frames, axis=0)[None]
 
+        raft_t0 = time.perf_counter()
         flow = self._raft.compute(prev_stacked, curr_stacked)  # [1, K*n_cam, 2, h8, w8]
+        self.stats["flow_ms"].append((time.perf_counter() - raft_t0) * 1000)
         _, _, _, h8, w8 = flow.shape
+        if (h8, w8) != self._flow_grid:
+            raise ValueError(
+                f"SEA-RAFT produced a {h8}x{w8} flow grid but the model expects "
+                f"{self._flow_grid[0]}x{self._flow_grid[1]} (flow_image_size="
+                f"{self.flow_config.flow_image_size}). Feed the runtime full-resolution camera "
+                "frames; do not resize images to the model resolution before the runtime sees them."
+            )
         flow = flow.reshape(k, n_cam, 2, h8, w8)
 
         result = {}
@@ -200,14 +263,51 @@ class FlowPiRuntime:
 
     # ---- public API ------------------------------------------------------------
 
+    def _check_slow_errors(self) -> None:
+        """Re-raise completed slow-worker exceptions in the calling thread.
+
+        A failed prefill must fail the replay/serving loop loudly instead of silently dropping
+        the prefix generation.
+        """
+        if not self._slow_futures:
+            return
+        remaining: list[Future] = []
+        for future in self._slow_futures:
+            if future.done():
+                future.result()  # raises the worker exception, if any
+            else:
+                remaining.append(future)
+        self._slow_futures = remaining
+
+    def _prefill(self, observation: _model.Observation) -> tuple[Any, jax.Array]:
+        """Run the VLM prefix encoder on a (preprocessed) observation, timing the prefill."""
+        t0 = time.perf_counter()
+        observation = _model.preprocess_observation(None, observation, train=False)
+        kv_cache, prefix_mask = self.model._prefix_forward(observation)  # noqa: SLF001
+        self.stats["prefill_ms"].append((time.perf_counter() - t0) * 1000)
+        return kv_cache, prefix_mask
+
+    def _publish(self, *, episode_id: int, source_tick: int, kv_cache: Any, prefix_mask: jax.Array) -> None:
+        """Atomically publish a completed prefill; cross-episode results are dropped."""
+        with self._slow_lock:
+            if episode_id == self._episode_id:
+                self._pending_prefix = PrefixGeneration(episode_id, source_tick, kv_cache, prefix_mask)
+            else:
+                self.num_generation_drops += 1
+
     def warm_start(self, observation: _model.Observation) -> None:
         """Begin a new episode: initialise ring buffer, run warm_start.
 
-        The caller should call ``refresh_prefix`` before the first ``tick``.
+        The caller should call ``refresh_prefix(observation, wait=True)`` before the first
+        ``tick``. Any in-flight slow refresh of the previous episode is invalidated.
         """
+        self._check_slow_errors()
         # A new episode starts from an empty ring buffer: stale frames of the previous episode
         # would otherwise leak into the first ticks' flow (cross-episode flow contamination).
         self._ring = None
+        self._frame_index = 0
+        self._prefix_source_tick = 0
+        self._episode_id += 1
         self._ingest_frame(observation)
 
         self._streaming_state = self.model.warm_start(
@@ -218,7 +318,7 @@ class FlowPiRuntime:
         )
         self._tick = 0
         # A new episode starts from a clean slow channel: drop any pending refresh of the
-        # previous episode.
+        # previous episode (in-flight worker results are dropped by the episode-id check).
         with self._slow_lock:
             self._pending_prefix = None
 
@@ -226,34 +326,53 @@ class FlowPiRuntime:
         """One fast control tick (50 Hz): fresh state + online flow + one NFE.
 
         A slow-channel refresh completed since the last tick is installed first (kv_cache +
-        prefix_mask swapped together, prefix_age reset to 0). Returns the ``d`` emitted actions
-        (shape ``[d, action_dim]``).
+        prefix_mask swapped together with the prefix source tick; the slow delay is then
+        `current_tick - prefix_source_tick`, which includes the VLM compute latency). Returns
+        the ``d`` emitted actions (shape ``[d, action_dim]``).
         """
+        self._check_slow_errors()
         # Install the latest completed slow-prefix refresh, if any, into the active streaming
-        # state. Publication is atomic: kv_cache and prefix_mask always come from the same
-        # prefix generation.
+        # state. Publication is atomic: kv_cache, prefix_mask and source metadata always come
+        # from the same prefix generation. A stale generation (previous episode, or computed
+        # from a frame older than the active prefix) is dropped.
         with self._slow_lock:
             pending = self._pending_prefix
             self._pending_prefix = None
         state = self._streaming_state
+        installed = False
         if pending is not None:
-            state = dataclasses.replace(
-                state,
-                kv_cache=pending[0],
-                prefix_mask=pending[1],
-                prefix_age=jnp.zeros((state.action_buffer.shape[0],), dtype=jnp.int32),
-            )
+            if pending.episode_id == self._episode_id and pending.source_tick >= (self._prefix_source_tick or 0):
+                # Fresh generation (>=: an equal source tick re-computes the same prefix, which
+                # is indistinguishable from the active one).
+                self._prefix_source_tick = pending.source_tick
+                state = dataclasses.replace(
+                    state,
+                    kv_cache=pending.kv_cache,
+                    prefix_mask=pending.prefix_mask,
+                    prefix_source_tick=jnp.full((state.action_buffer.shape[0],), pending.source_tick, dtype=jnp.int32),
+                )
+                installed = True
+            else:
+                # Stale generation (previous episode, or computed from a frame older than the
+                # active prefix): never installed.
+                self.num_generation_drops += 1
 
+        self._frame_index += 1
         self._ingest_frame(observation)
         flow_data, flow_masks = self._compute_flow()
 
-        # Attach fresh flow, per-lag validity, and the slow-channel delay (age of the exact
-        # prefix stored in the streaming state; clamped so the embedding lookup stays in range).
+        # Attach fresh flow, per-lag validity, and the slow-channel delay: the age of the exact
+        # prefix stored in the streaming state, `current_tick - prefix_source_tick` (clamped so
+        # the embedding lookup stays in range).
+        delay = max(0, self._frame_index - (self._prefix_source_tick or 0))
+        delay = min(delay, self.flow_config.vlm_delay_max)
+        if installed:
+            self.stats["prefix_age_at_install"].append(delay)
         obs_with_flow = dataclasses.replace(
             observation,
             flow={cam: jnp.asarray(arr)[None, ...] for cam, arr in flow_data.items()},
             flow_masks={cam: jnp.asarray(mask)[None, ...] for cam, mask in flow_masks.items()},
-            vlm_delay=jnp.minimum(state.prefix_age, self.flow_config.vlm_delay_max),
+            vlm_delay=jnp.full((observation.state.shape[0],), delay, dtype=jnp.int32),
         )
 
         # One NFE (per-tick RNG: must not repeat after a prefix refresh resets the age).
@@ -263,18 +382,53 @@ class FlowPiRuntime:
         self._streaming_state = new_state
         return np.asarray(emit[0])  # [d, action_dim]
 
-    def refresh_prefix(self, observation: _model.Observation) -> None:
+    def refresh_prefix(self, observation: _model.Observation, *, wait: bool = False) -> None:
         """Slow-channel: re-run the VLM prefix encoder and produce fresh KV cache.
 
-        The expensive computation happens outside the lock; the result is then published
+        By default the prefill runs on a single background worker; the result is published
         atomically and installed into the active streaming state at the start of the next fast
-        tick (prefix_age resets to 0 only when that new prefix becomes active). Call from a
-        background thread (e.g. every N ticks).
+        tick (the prefix source tick is recorded at installation time, so the slow delay keeps
+        counting from the observation this prefix was computed from). With ``wait=True`` the
+        prefill runs synchronously in the calling thread and supersedes any in-flight refresh.
+
+        The observation is assumed to be the most recently ingested frame (its episode-relative
+        index becomes the new prefix source tick). Worker exceptions are re-raised in the main
+        thread at the next tick/refresh/close.
         """
-        observation = _model.preprocess_observation(None, observation, train=False)
-        kv_cache, prefix_mask = self.model._prefix_forward(observation)  # noqa: SLF001
+        self._check_slow_errors()
+        episode_id = self._episode_id
+        source_tick = self._frame_index
+        # Invalidate any in-flight refresh: only the most recent generation may publish.
+        self._slow_latest_gen += 1
+        if wait:
+            kv_cache, prefix_mask = self._prefill(observation)
+            self._publish(episode_id=episode_id, source_tick=source_tick, kv_cache=kv_cache, prefix_mask=prefix_mask)
+        else:
+            gen = self._slow_latest_gen
+            future = self._slow_executor.submit(self._slow_run, gen, episode_id, source_tick, observation)
+            self._slow_futures.append(future)
+
+    def _slow_run(
+        self,
+        gen: int,
+        episode_id: int,
+        source_tick: int,
+        observation: _model.Observation,
+    ) -> None:
+        """Worker: prefill + publish (only if still the latest generation and same episode)."""
+        kv_cache, prefix_mask = self._prefill(observation)
         with self._slow_lock:
-            self._pending_prefix = (kv_cache, prefix_mask)
+            if gen == self._slow_latest_gen and episode_id == self._episode_id:
+                self._pending_prefix = PrefixGeneration(episode_id, source_tick, kv_cache, prefix_mask)
+            else:
+                self.num_generation_drops += 1
+
+    def close(self) -> None:
+        """Drain the slow worker and re-raise its first exception, if any. Idempotent."""
+        self._slow_executor.shutdown(wait=True)
+        futures, self._slow_futures = self._slow_futures, []
+        for future in futures:
+            future.result()
 
     def emit(self) -> np.ndarray:
         """Return the current action chunk (the first ``d`` actions in the buffer).

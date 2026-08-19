@@ -653,6 +653,96 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
+def _flowpi_ablation_configs() -> tuple[TrainConfig, ...]:
+    """Builds the flowpi ablation configs A-E (see the comment above the config list)."""
+
+    def make(
+        name: str, exp_name: str, flow: pi0_config.FlowConfig | None, *, discrete_state_input: bool
+    ) -> TrainConfig:
+        model = pi0_config.Pi0Config(
+            pi05=True,
+            discrete_state_input=discrete_state_input,
+            flow=flow,
+            freeze_vision_encoder=True,
+        )
+        data_flow = (
+            FlowDataConfig(
+                mode="cache",
+                flow_cache_dir="<your-flow-cache-dir>",
+                sea_raft_ckpt="<your-sea-raft-ckpt>",
+                sea_raft_device="cuda",
+            )
+            if flow is not None
+            else None
+        )
+        return TrainConfig(
+            name=name,
+            model=model,
+            data=LeRobotAlohaDataConfig(
+                repo_id="<your-dataset>/adjust_bottle",
+                default_prompt="Adjust the bottle on the table",
+                assets=AssetsConfig(
+                    assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                    asset_id="trossen",
+                ),
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "images": {
+                                    "cam_high": "observation.images.cam_high",
+                                    "cam_left_wrist": "observation.images.cam_left_wrist",
+                                    "cam_right_wrist": "observation.images.cam_right_wrist",
+                                },
+                                "state": "observation.state",
+                                "actions": "action",
+                            }
+                        )
+                    ]
+                ),
+                flow=data_flow,
+            ),
+            weight_loader=weight_loaders.FlowPiWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+            freeze_filter=model.get_freeze_filter(),
+            num_train_steps=20_000,
+            batch_size=32,
+            seed=42,
+        )
+
+    return (
+        make(
+            "flowpi_abl_a_pi05_baseline",
+            "flowpi_abl_a_pi05_baseline",
+            None,
+            discrete_state_input=True,
+        ),
+        make(
+            "flowpi_abl_b_fresh_state",
+            "flowpi_abl_b_fresh_state",
+            pi0_config.FlowConfig(use_delay=False, use_flow=False, use_pir2=False),
+            discrete_state_input=False,
+        ),
+        make(
+            "flowpi_abl_c_pir2",
+            "flowpi_abl_c_pir2",
+            pi0_config.FlowConfig(use_delay=False, use_flow=False),
+            discrete_state_input=False,
+        ),
+        make(
+            "flowpi_abl_d_delay",
+            "flowpi_abl_d_delay",
+            pi0_config.FlowConfig(use_flow=False),
+            discrete_state_input=False,
+        ),
+        make(
+            "flowpi_abl_e_flow",
+            "flowpi_abl_e_flow",
+            pi0_config.FlowConfig(),
+            discrete_state_input=False,
+        ),
+    )
+
+
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     #
@@ -1074,6 +1164,7 @@ _CONFIGS = [
             paligemma_variant="dummy",
             action_expert_variant="dummy",
             flow=pi0_config.FlowConfig(d_max=2, injection_layers=(1, 2), vlm_delay_max=3),
+            freeze_vision_encoder=True,
         ),
         data=FakeDataConfig(),
         batch_size=2,
@@ -1088,6 +1179,7 @@ _CONFIGS = [
             paligemma_variant="dummy",
             action_expert_variant="dummy",
             flow=pi0_config.FlowConfig(d_max=2, injection_layers=(1, 2), vlm_delay_max=3),
+            freeze_vision_encoder=True,
         ).get_freeze_filter(),
     ),
     TrainConfig(
@@ -1098,6 +1190,7 @@ _CONFIGS = [
             pi05=True,
             discrete_state_input=False,
             flow=pi0_config.FlowConfig(),
+            freeze_vision_encoder=True,
         ),
         data=LeRobotAlohaDataConfig(
             repo_id="<your-dataset>/adjust_bottle",
@@ -1130,11 +1223,26 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.FlowPiWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         freeze_filter=pi0_config.Pi0Config(
-            pi05=True, discrete_state_input=False, flow=pi0_config.FlowConfig()
+            pi05=True, discrete_state_input=False, flow=pi0_config.FlowConfig(), freeze_vision_encoder=True
         ).get_freeze_filter(),
         num_train_steps=20_000,
         batch_size=32,
     ),
+    #
+    # flowpi ablation configs A-E. Every variant shares the flowpi_aloha training recipe: the
+    # same pretrained checkpoint (π0.5 base via FlowPiWeightLoader; the flowpi modules are
+    # fresh-initialized deterministically from the shared seed=42, so B-E start from identical
+    # weights), the same freeze (SigLIP), data, batch size, steps, LR, horizon, augment and
+    # seed. The `use_*` toggles gate a channel's *use* without changing the parameter layout,
+    # so B-E also share one architecture and one checkpoint format.
+    #
+    #   A: π0.5 matched baseline          (flow=None: exactly the π0.5 architecture)
+    #   B: + fresh state                 (flow_state_proj state token, every NFE)
+    #   C: + πR²                         (staircase per-position noise)
+    #   D: + delay                       (flow_vlm_delay_fast adaRMS conditioning)
+    #   E: + flow                        (= flowpi_aloha, the full model)
+    #
+    *(_flowpi_ablation_configs()),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),

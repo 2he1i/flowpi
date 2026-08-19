@@ -4,9 +4,11 @@ Consumes `obs.flow` (normalized, per camera `[B, K, 2, H//8, W//8]`) and `obs.fl
 (per-lag validity `[B, K]`), and produces a single token sequence `[B, n_cam*K*grid, D]` for the
 gated flow cross-attention inside the action expert.
 
-All parameters are normally initialized (no zero-init here — the only zero-initialized flow
-parameters are the cross-attention gates in gemma.Module, which keep the model exactly equivalent
-to the baseline π0.5 at initialization while still admitting gradient flow from step 0).
+All parameters are normally initialized (no zero-init here). The cross-attention gates in
+gemma.Module are zero-initialized: at initialization tanh(gate) = 0 zeroes the whole flow
+branch, so the model is exactly equivalent to the baseline π0.5 and the flow branch receives no
+direct gradient at step 0. Gradient flow for the flow branch starts as soon as the gates move
+(tanh(gate) != 0), which is what the AdaRM/CFG-style training dynamics rely on.
 """
 
 import flax.nnx as nnx

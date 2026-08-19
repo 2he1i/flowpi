@@ -408,9 +408,10 @@ def test_loss_scale_invariants():
             np.testing.assert_allclose(computed, np.asarray(jnp.mean(sq, axis=-1)), rtol=1e-5, atol=1e-5)
 
 
-def test_prefix_refresh_swaps_kv_and_resets_age():
-    """refresh_prefix must swap (kv_cache, prefix_mask) together and reset prefix_age only for
-    that new generation; fast ticks must never touch the active prefix."""
+def test_prefix_refresh_swaps_kv_and_carries_source_tick():
+    """refresh_prefix must swap (kv_cache, prefix_mask) together and never touch the action
+    buffer; the prefix source tick is carried through fast ticks and only the runtime installs a
+    new value (the model cannot know the current tick)."""
     model = _make_model(_flow_config())
     config = model.config
     obs = _fake_obs(config, seed=1)
@@ -421,23 +422,26 @@ def test_prefix_refresh_swaps_kv_and_resets_age():
     state = model.warm_start(jax.random.key(0), obs, num_steps=3, d=1)
     kv_old = jax.tree.leaves(state.kv_cache)
     mask_old = np.asarray(state.prefix_mask)
+    # The warm-start prefix comes from the episode-start observation (tick 0).
+    assert int(state.prefix_source_tick[0]) == 0
 
-    # A fast tick must not touch the prefix: same KV, same mask, age +1 only.
+    # A fast tick must not touch the prefix: same KV, same mask, source tick carried through.
     _, state = model.denoise_step(state, obs, jax.random.key(5), d=1)
-    assert int(state.prefix_age[0]) == 1
+    assert int(state.prefix_source_tick[0]) == 0
     np.testing.assert_array_equal(np.asarray(state.prefix_mask), mask_old)
     assert all(
         np.array_equal(np.asarray(a), np.asarray(b))
         for a, b in zip(jax.tree.leaves(state.kv_cache), kv_old, strict=True)
     )
 
-    # Refresh: new KV + matching mask + age reset; the action buffer is untouched.
+    # Refresh: new KV + matching mask; the action buffer and the source tick are untouched (the
+    # runtime records the observation's tick and installs it with the new prefix).
     refreshed = model.refresh_prefix(state, obs2)
     kv_new = jax.tree.leaves(refreshed.kv_cache)
     assert any(not np.array_equal(np.asarray(a), np.asarray(b)) for a, b in zip(kv_new, kv_old, strict=True))
     expected_mask = np.asarray(model._prefix_forward(obs2)[1])  # noqa: SLF001
     np.testing.assert_array_equal(np.asarray(refreshed.prefix_mask), expected_mask)
-    assert int(refreshed.prefix_age[0]) == 0
+    assert int(refreshed.prefix_source_tick[0]) == 0
     np.testing.assert_array_equal(np.asarray(refreshed.action_buffer), np.asarray(state.action_buffer))
 
 
@@ -476,7 +480,7 @@ def test_delay_conditions_fast_suffix():
 
 def test_streaming_runtime():
     """warm_start + N ticks of denoise_step(d=1): tau profile cycles, one action per tick, tail is
-    fresh noise, prefix_age increments and resets on refresh."""
+    fresh noise, the prefix source tick is carried through and never touched by fast ticks."""
     model = _make_model(_flow_config())
     config = model.config
     h = config.action_horizon
@@ -487,6 +491,7 @@ def test_streaming_runtime():
     # Staircase in-flight prefix has at least d zeros (p=d lands exactly on t=0 too).
     assert int((tau0 == 0).sum()) >= 1
     assert float(tau0[-1]) == 1.0
+    assert int(state.prefix_source_tick[0]) == 0
 
     emitted = []
     for tick in range(h - 2):
@@ -496,13 +501,77 @@ def test_streaming_runtime():
         emitted.append(acts)
         # tau profile after shift matches the original staircase (self-similarity).
         np.testing.assert_allclose(np.asarray(state.tau[0]), np.asarray(tau0), atol=1e-5)
-        assert int(state.prefix_age[0]) == tick + 1
+        # Fast ticks never touch the prefix source tick (the runtime owns the delay clock).
+        assert int(state.prefix_source_tick[0]) == 0
 
     # Tail of the buffer holds fresh noise ~ N(0, 1).
     assert float(jnp.std(state.action_buffer[:, -2:])) > 0.1
 
+    # refresh_prefix keeps the source tick as well (the runtime installs it on publication).
     refreshed = model.refresh_prefix(state, obs)
-    assert int(refreshed.prefix_age[0]) == 0
+    assert int(refreshed.prefix_source_tick[0]) == 0
+
+
+def test_ablation_toggles_gate_usage_not_layout():
+    """The `use_*` toggles must disable a channel in the forward pass without changing the
+    parameter layout (every flowpi configuration shares one architecture and one checkpoint)."""
+    obs = _fake_obs(_make_model(_flow_config()).config)
+
+    # 1) use_fresh_state=False: no state token in the suffix (H tokens instead of H+1).
+    on = _make_model(_flow_config())
+    no_fresh = _make_model(_flow_config(use_fresh_state=False))
+    no_delay = _make_model(_flow_config(use_delay=False))
+    no_flow = _make_model(_flow_config(use_flow=False))
+    actions = jax.random.normal(jax.random.key(7), (2, on.config.action_horizon, on.config.action_dim))
+    tau = jnp.broadcast_to(jnp.full((2,), 0.4)[:, None], (2, on.config.action_horizon))
+    tokens_on, _, _, _ = on.embed_suffix(obs, actions, tau)
+    tokens_off, _, _, _ = no_fresh.embed_suffix(obs, actions, tau)
+    assert tokens_on.shape[1] == on.config.action_horizon + 1
+    assert tokens_off.shape[1] == on.config.action_horizon
+
+    # 2) use_delay=False: the delay embedding is never consulted, even with vlm_delay present.
+    delayed_obs = dataclasses.replace(obs, vlm_delay=jnp.zeros((2,), dtype=jnp.int32))
+    assert on._vlm_delay(delayed_obs) is not None  # noqa: SLF001
+    assert no_delay._vlm_delay(delayed_obs) is None  # noqa: SLF001
+
+    # 3) use_flow=False: no flow tokens even with flow in the observation.
+    flow_obs = dataclasses.replace(
+        obs,
+        flow={
+            cam: jnp.zeros((2, on.config.flow.num_flow_steps, 2, 60, 80))
+            for cam in ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
+        },
+        flow_masks={
+            cam: jnp.ones((2, on.config.flow.num_flow_steps), dtype=jnp.bool_)
+            for cam in ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
+        },
+    )
+    assert on.embed_flow(flow_obs) is not None
+    assert no_flow.embed_flow(flow_obs) is None
+
+    # 4) use_pir2=False: the loss still runs (baseline β(t) path) at the baseline scale.
+    no_pir2 = _make_model(_flow_config(use_pir2=False))
+    loss = no_pir2.compute_loss(
+        jax.random.key(3),
+        obs,
+        jax.random.normal(jax.random.key(4), (2, no_pir2.config.action_horizon, no_pir2.config.action_dim)),
+    )
+    assert loss.shape == (2, no_pir2.config.action_horizon)
+    assert bool(jnp.all(jnp.isfinite(loss)))
+
+    # 5) Parameter layout is identical across toggle settings (same checkpoint format).
+    def param_count(model) -> int:
+        _, state = nnx.split(model)
+        return sum(int(x.size) for x in jax.tree.leaves(state))
+
+    counts = {
+        param_count(_make_model(_flow_config())),
+        param_count(_make_model(_flow_config(use_fresh_state=False))),
+        param_count(_make_model(_flow_config(use_delay=False))),
+        param_count(_make_model(_flow_config(use_flow=False))),
+        param_count(_make_model(_flow_config(use_pir2=False))),
+    }
+    assert len(counts) == 1, f"toggle variants have different parameter layouts: {counts}"
 
 
 def test_flow_config_validation():
@@ -511,6 +580,10 @@ def test_flow_config_validation():
         {"num_flow_steps": 0},
         {"flow_stride_frames": 0},
         {"flow_scale": 0.0},
+        {"flow_clamp": 0.0},
+        {"tokenizer_channels": ()},
+        {"tokenizer_channels": (32, 0)},
+        {"tokenizer_mlp_hidden": 0},
         {"p_standard": 1.5},
         {"p_standard": -0.1},
         {"tau_jitter": 1.0},
@@ -527,3 +600,12 @@ def test_flow_config_validation():
     # A valid config (and defaults) construct fine.
     _pi0_config.FlowConfig()
     _pi0_config.FlowConfig(injection_layers=(1, 3))
+
+    # Injection layers must fit inside the action expert depth (fail at config time).
+    with pytest.raises(AssertionError, match="out of range"):
+        _pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="dummy",
+            action_expert_variant="dummy",
+            flow=_pi0_config.FlowConfig(injection_layers=(3, 4)),  # dummy depth is 4
+        )

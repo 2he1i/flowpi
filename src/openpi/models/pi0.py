@@ -149,9 +149,24 @@ class Pi0(_model.BaseModel):
                 embedding_init=nnx.initializers.zeros_init(),
                 rngs=rngs,
             )
+            # Fast-channel delay embedding for the AE adaRMS conditioning (zeros init: the fast
+            # Action Expert is an exact no-op w.r.t. delay until trained).
+            self.flow_vlm_delay_fast = nnx.Embed(
+                num_embeddings=flow_cfg.vlm_delay_max + 1,
+                features=action_expert_config.width,
+                embedding_init=nnx.initializers.zeros_init(),
+                rngs=rngs,
+            )
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
+
+    def _vlm_delay(self, obs: _model.Observation) -> jax.Array | None:
+        """Slow-channel delay, clamped to ``vlm_delay_max`` so the embedding lookup can never go
+        out of range (any staleness beyond the trained maximum maps to the max-delay embedding)."""
+        if self.flow_config is None or obs.vlm_delay is None:
+            return None
+        return jnp.minimum(obs.vlm_delay, self.flow_config.vlm_delay_max)
 
     @at.typecheck
     def embed_prefix(
@@ -165,8 +180,9 @@ class Pi0(_model.BaseModel):
             image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
 
             # flowpi: slow-channel delay embedding (zeros init => exact no-op when unused).
-            if self.flow_config is not None and obs.vlm_delay is not None:
-                image_tokens = image_tokens + self.flow_vlm_delay(obs.vlm_delay)[:, None, :]
+            vlm_delay = self._vlm_delay(obs)
+            if vlm_delay is not None:
+                image_tokens = image_tokens + self.flow_vlm_delay(vlm_delay)[:, None, :]
 
             tokens.append(image_tokens)
             input_mask.append(
@@ -231,6 +247,14 @@ class Pi0(_model.BaseModel):
             time_emb = self.time_mlp_out(time_emb)
             time_emb = nnx.swish(time_emb)
             action_expert_tokens = action_tokens
+            # flowpi: the cached slow prefix is stale for `vlm_delay` ticks and its tokens are
+            # frozen inside the KV cache, so the fast Action Expert must be told the staleness
+            # explicitly. The delay embedding (zeros init) is broadcast across action positions
+            # and added to the per-position time conditioning for adaRMS.
+            vlm_delay = self._vlm_delay(obs)
+            if vlm_delay is not None:
+                delay_emb = self.flow_vlm_delay_fast(vlm_delay)
+                time_emb = time_emb + (delay_emb[:, None, :] if per_position else delay_emb)
             adarms_cond = time_emb  # [B, (H), emb]
         else:
             # mix timestep + action information using an MLP (no adaRMS)
@@ -586,9 +610,11 @@ class Pi0(_model.BaseModel):
         # Positions that were already clean (t=0) stay clean — no updates below t=0.
         x_new = jnp.where(tau[..., None] > 0, x_new, x)
 
-        # Shift left by d; emit the d front actions; append d fresh noise at the tail.
-        emit = jax.lax.stop_gradient(x_new[:, :d])
+        # Shift left by d; emit the d front actions of the *shifted* buffer (the positions that
+        # just reached the execution boundary; the pre-shift front [0:d) was already executed by
+        # the previous step / warm_start); append d fresh noise at the tail.
         shifted = jax.lax.dynamic_slice(x_new, (0, d, 0), (batch_size, horizon - d, self.action_dim))
+        emit = jax.lax.stop_gradient(shifted[:, :d])
         tail_rng, _ = jax.random.split(rng)
         tail = jax.random.normal(tail_rng, (batch_size, d, self.action_dim))
         x_next = jnp.concatenate([shifted, tail], axis=1)

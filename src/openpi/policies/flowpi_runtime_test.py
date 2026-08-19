@@ -107,19 +107,34 @@ def _run_runtime_test(sea_raft_device="cpu"):
     assert np.all(np.isfinite(initial_actions))
 
     tick_actions = []
+    kv_before_refresh = None
     for i in range(1, n_frames):
         acts = runtime.tick(observations[i])
         assert acts.shape == (1, 32), f"tick {i}: shape {acts.shape}"
         assert np.all(np.isfinite(acts)), f"tick {i}: nan"
         tick_actions.append(acts)
-        # _prefix_age counts ticks since last refresh; resets on refresh.
-        expected_age = i - ((i - 1) // 5) * 5
-        assert runtime._prefix_age == expected_age  # noqa: SLF001
 
-        # Refresh every 5 ticks.
+        # StreamingState.prefix_age is the canonical slow-channel age: it counts ticks since the
+        # *active* prefix was installed (refresh publishes asynchronously; the age only resets
+        # once the new prefix becomes active at the next tick).
+        expected_age = i - ((i - 1) // 5) * 5
+        age = int(runtime._streaming_state.prefix_age[0])  # noqa: SLF001
+        assert age == expected_age, f"tick {i}: age {age} != {expected_age}"
+
+        # A refresh completed at the previous tick must have been installed by now: the active
+        # KV cache changed and the age restarted from the installation tick.
+        if kv_before_refresh is not None:
+            kv_now = jax.tree.leaves(runtime._streaming_state.kv_cache)  # noqa: SLF001
+            changed = any(np.any(np.asarray(a) != np.asarray(b)) for a, b in zip(kv_now, kv_before_refresh, strict=True))
+            assert changed, f"tick {i}: refresh result was not installed into the streaming state"
+            assert age == 1, f"tick {i}: age {age} != 1 right after a prefix swap"
+            kv_before_refresh = None
+
+        # Refresh every 5 ticks: publish a fresh prefix but do NOT touch the active age yet.
         if i % 5 == 0:
+            kv_before_refresh = jax.tree.leaves(runtime._streaming_state.kv_cache)  # noqa: SLF001
             runtime.refresh_prefix(observations[i])
-            assert runtime._prefix_age == 0  # noqa: SLF001
+            assert int(runtime._streaming_state.prefix_age[0]) == expected_age  # noqa: SLF001
 
     # Post-refresh age check.
     assert len(tick_actions) == n_frames - 1

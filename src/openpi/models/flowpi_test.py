@@ -1,15 +1,21 @@
 """flowpi model tests (dummy variants, fast on GPU/CPU).
 
 Covers: zero-gate equivalence, init gradient invariants, parameter budget, staircase
-construction/self-similarity, per-position RMSNorm, and the streaming runtime.
+construction/self-similarity, per-position RMSNorm, the streaming runtime, action-emission
+progression, all-invalid flow cross-attention, loss-scale algebra, prefix-refresh KV swapping,
+and fast-path delay conditioning.
 """
 
+import dataclasses
+
+import einops
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 
+import openpi.models.model as _model
 import openpi.models.pi0 as _pi0
 import openpi.models.pi0_config as _pi0_config
 
@@ -278,6 +284,192 @@ def test_per_position_rmsnorm_shapes():
     cond_const = jnp.broadcast_to(cond[:, None, :], (b, s, d))
     out_const, _ = norm.apply({"params": params}, x, cond_const)
     np.testing.assert_allclose(np.asarray(out_const), np.asarray(out_legacy), rtol=1e-5, atol=1e-5)
+
+
+def test_streaming_action_progression_no_duplication():
+    """Each action-buffer position is emitted exactly once: warm_start emits buffer positions
+    [0:d), and the k-th streaming tick emits the positions [k*d:(k+1)*d) of the original
+    warm-start buffer. Regression test for the emit off-by-`d` (the already-executed prefix must
+    never be re-emitted)."""
+    model = _make_model(_flow_config())
+    config = model.config
+    h = config.action_horizon
+    obs = _fake_obs(config)
+    d = 1
+
+    state = model.warm_start(jax.random.key(0), obs, num_steps=3, d=d)
+    buffer0 = np.asarray(state.action_buffer)  # [B, H, D] of the warm-start generation
+    warm_emit = np.asarray(state.action_buffer[0, :d])
+
+    # Deterministic zero velocity: the denoise step then only shifts the buffer, so the emitted
+    # values are exactly the original buffer positions that reached the execution boundary.
+    model._suffix_forward = lambda *a, **k: jnp.zeros((2, h, config.action_dim))  # noqa: SLF001
+    for tick in range(3):
+        acts, state = model.denoise_step(state, obs, jax.random.key(100 + tick), d=d)
+        expected = buffer0[0, (tick + 1) * d : (tick + 2) * d]
+        np.testing.assert_array_equal(np.asarray(acts[0]), expected)
+        assert not np.array_equal(np.asarray(acts[0]), warm_emit), f"tick {tick}: re-emitted warm-start actions"
+
+
+def test_flow_cross_attn_all_invalid_is_exactly_zero():
+    """All-invalid flow masks must produce exactly zero flow cross-attention output (regression
+    for the all-invalid flow handling)."""
+    import openpi.models.gemma as _gemma
+
+    b, s, n_heads, head_dim, width, n_flow = 2, 5, 8, 16, 64, 4
+    q_hidden = jax.random.normal(jax.random.key(0), (b, s, width))
+    flow = jax.random.normal(jax.random.key(1), (b, n_flow, width))
+    # Slot-stacked parameters: [slot, n_heads, width, head_dim] (one slot used below).
+    params = {
+        "flow_q": jax.random.normal(jax.random.key(2), (1, n_heads, width, head_dim)),
+        "flow_kv": jax.random.normal(jax.random.key(3), (1, 2, n_heads, width, head_dim)),
+        "flow_out": jax.random.normal(jax.random.key(4), (1, n_heads, head_dim, width)),
+    }
+
+    out = _gemma._flow_cross_attn(  # noqa: SLF001
+        q_hidden, flow, jnp.zeros((b, n_flow), dtype=bool), params, 0, head_dim=head_dim
+    )
+    np.testing.assert_array_equal(np.asarray(out), 0.0)
+
+    # With at least one valid flow token the output is nonzero (sanity: the test is not vacuous).
+    mask = jnp.zeros((b, n_flow), dtype=bool).at[:, 0].set(True)
+    out_valid = _gemma._flow_cross_attn(q_hidden, flow, mask, params, 0, head_dim=head_dim)  # noqa: SLF001
+    assert np.any(np.asarray(out_valid) != 0.0)
+
+
+def test_loss_scale_invariants():
+    """The FlowPi masked-loss reduction keeps the baseline π0.5 scale. For standard-FM rows with
+    all positions valid the renormalization factor is exactly 1 (loss = mean(sq), i.e. the
+    baseline reduction); for πR² rows the loss reduces to the mean over the non-inpainted
+    positions only (factor horizon / valid_count)."""
+    for p_standard, tau_jitter in ((1.0, 0.01), (0.0, 0.0)):
+        model = _make_model(_flow_config(p_standard=p_standard, tau_jitter=tau_jitter))
+        config = model.config
+        h = config.action_horizon
+        batch_shape = (2,)
+        obs = _fake_obs(config)
+        actions = jax.random.normal(jax.random.key(2), (2, h, config.action_dim))
+        rng = jax.random.key(7)
+
+        computed = np.asarray(model.compute_loss(rng, obs, actions))
+
+        # Replicate the exact rng splits of compute_loss.
+        preprocess_rng, noise_rng, time_rng, mix_rng = jax.random.split(rng, 4)
+        obs_p = _model.preprocess_observation(preprocess_rng, obs, train=False)
+        noise = jax.random.normal(noise_rng, actions.shape)
+        d_rng, jitter_rng, std_rng = jax.random.split(time_rng, 3)
+
+        if p_standard == 1.0:
+            t_std = jax.random.beta(std_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
+            tau = einops.repeat(t_std, "b -> b h", h=h)
+            loss_mask = jnp.ones((2, h))
+        else:
+            d = jax.random.randint(d_rng, batch_shape, minval=1, maxval=config.flow.d_max + 1)
+            pos = jnp.arange(h)
+            tau = jnp.where(
+                pos[None, :] < d[:, None],
+                0.0,
+                jnp.where(pos[None, :] >= h - d[:, None], 1.0, (pos[None, :] - d[:, None]) / (h - 2 * d[:, None])),
+            )
+            jitter = jax.random.uniform(jitter_rng, actions.shape[:-1], minval=-tau_jitter, maxval=tau_jitter)
+            mid = (tau > 0) & (tau < 1)
+            tau = jnp.where(mid, jnp.clip(tau + jitter, 0.0, 1.0), tau)
+            loss_mask = ~(tau == 0.0)
+
+        inpaint = tau == 0.0
+        x_t = tau[..., None] * noise + (1 - tau[..., None]) * actions
+        x_t = jnp.where(inpaint[..., None], actions, x_t)
+        u_t = noise - actions
+
+        prefix_tokens, prefix_mask, prefix_ar_mask = model.embed_prefix(obs_p)
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = model.embed_suffix(obs_p, x_t, tau)
+        input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
+        ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
+        attn_mask = _pi0.make_attn_mask(input_mask, ar_mask)
+        positions = jnp.cumsum(input_mask, axis=1) - 1
+        flow_tokens, flow_token_mask = model.embed_flow(obs_p)
+        (_, s_out), _ = model.PaliGemma.llm(
+            [prefix_tokens, suffix_tokens],
+            mask=attn_mask,
+            positions=positions,
+            adarms_cond=[None, adarms_cond],
+            flow=flow_tokens,
+            flow_mask=flow_token_mask,
+        )
+        v_t = model.action_out_proj(s_out[:, -h:])
+
+        sq = jnp.square(v_t - u_t)
+        valid_count = jnp.maximum(jnp.sum(loss_mask, axis=-1, keepdims=True), 1.0)
+        manual = jnp.mean(sq, axis=-1) * loss_mask * (h / valid_count)
+        np.testing.assert_allclose(computed, np.asarray(manual), rtol=1e-5, atol=1e-5)
+        if p_standard == 1.0:
+            # All positions valid => the renormalization factor is exactly 1 (baseline π0.5 scale).
+            np.testing.assert_allclose(computed, np.asarray(jnp.mean(sq, axis=-1)), rtol=1e-5, atol=1e-5)
+
+
+def test_prefix_refresh_swaps_kv_and_resets_age():
+    """refresh_prefix must swap (kv_cache, prefix_mask) together and reset prefix_age only for
+    that new generation; fast ticks must never touch the active prefix."""
+    model = _make_model(_flow_config())
+    config = model.config
+    obs = _fake_obs(config, seed=1)
+    # Different prompt => different prefix tokens => different KV (the dummy SigLIP tower is a
+    # zero-output no-op, so the prompt is the controllable prefix differentiator here).
+    obs2 = dataclasses.replace(obs, tokenized_prompt=jnp.zeros_like(obs.tokenized_prompt))
+
+    state = model.warm_start(jax.random.key(0), obs, num_steps=3, d=1)
+    kv_old = jax.tree.leaves(state.kv_cache)
+    mask_old = np.asarray(state.prefix_mask)
+
+    # A fast tick must not touch the prefix: same KV, same mask, age +1 only.
+    _, state = model.denoise_step(state, obs, jax.random.key(5), d=1)
+    assert int(state.prefix_age[0]) == 1
+    np.testing.assert_array_equal(np.asarray(state.prefix_mask), mask_old)
+    assert all(
+        np.array_equal(np.asarray(a), np.asarray(b)) for a, b in zip(jax.tree.leaves(state.kv_cache), kv_old, strict=True)
+    )
+
+    # Refresh: new KV + matching mask + age reset; the action buffer is untouched.
+    refreshed = model.refresh_prefix(state, obs2)
+    kv_new = jax.tree.leaves(refreshed.kv_cache)
+    assert any(not np.array_equal(np.asarray(a), np.asarray(b)) for a, b in zip(kv_new, kv_old, strict=True))
+    expected_mask = np.asarray(model._prefix_forward(obs2)[1])  # noqa: SLF001
+    np.testing.assert_array_equal(np.asarray(refreshed.prefix_mask), expected_mask)
+    assert int(refreshed.prefix_age[0]) == 0
+    np.testing.assert_array_equal(np.asarray(refreshed.action_buffer), np.asarray(state.action_buffer))
+
+
+def test_delay_conditions_fast_suffix():
+    """The fast Action Expert must be conditioned on the slow-channel delay: identical inputs
+    with different vlm_delay must change the fast suffix path (via the adaRMS conditioning), and
+    out-of-range delays clamp to the max-delay embedding."""
+    model = _make_model(_flow_config())
+    config = model.config
+    obs = _fake_obs(config)
+    actions = jax.random.normal(jax.random.key(2), (2, config.action_horizon, config.action_dim))
+    tau = jnp.broadcast_to(jnp.full((2,), 0.4)[:, None], (2, config.action_horizon))
+
+    delay_0 = jnp.zeros((2,), dtype=jnp.int32)
+    delay_max = jnp.full((2,), config.flow.vlm_delay_max, dtype=jnp.int32)
+
+    # At initialization the delay embedding is zero: the fast AE is an exact no-op w.r.t. delay
+    # (pretrained-path preservation).
+    _, _, _, cond_a = model.embed_suffix(dataclasses.replace(obs, vlm_delay=delay_0), actions, tau)
+    _, _, _, cond_b = model.embed_suffix(dataclasses.replace(obs, vlm_delay=delay_max), actions, tau)
+    np.testing.assert_array_equal(np.asarray(cond_a), np.asarray(cond_b))
+
+    # With a nonzero (learned) embedding, different delays must change the fast conditioning.
+    model.flow_vlm_delay_fast.embedding.value = jax.random.normal(
+        jax.random.key(3), model.flow_vlm_delay_fast.embedding.value.shape
+    )
+    _, _, _, cond_a = model.embed_suffix(dataclasses.replace(obs, vlm_delay=delay_0), actions, tau)
+    _, _, _, cond_b = model.embed_suffix(dataclasses.replace(obs, vlm_delay=delay_max), actions, tau)
+    assert not np.allclose(np.asarray(cond_a), np.asarray(cond_b))
+
+    # Delays beyond vlm_delay_max clamp to the max-delay embedding (never an OOB lookup).
+    delay_big = jnp.full((2,), 100, dtype=jnp.int32)
+    _, _, _, cond_big = model.embed_suffix(dataclasses.replace(obs, vlm_delay=delay_big), actions, tau)
+    np.testing.assert_array_equal(np.asarray(cond_big), np.asarray(cond_b))
 
 
 def test_streaming_runtime():

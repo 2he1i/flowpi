@@ -101,7 +101,6 @@ class FlowPiRuntime:
         self.model = model
         self.flow_config = flow_config
         self._d = d
-        self._prefix_age = 0
 
         self._cam_keys = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
 
@@ -118,14 +117,17 @@ class FlowPiRuntime:
             device=sea_raft_device,
         )
 
-        # Slow-channel background state (updated by background thread).
-        self._kv_cache: Any = None
-        self._prefix_mask: Any = None
+        # Slow-channel publication: a completed background prefix refresh is published here
+        # atomically (kv_cache + prefix_mask as one consistent tuple) and installed into the
+        # active StreamingState at the start of the next fast tick.
+        self._pending_prefix: tuple[Any, Any] | None = None
         self._slow_lock = threading.Lock()
 
-        # Per-episode streaming state.
+        # Per-episode streaming state. `StreamingState.prefix_age` is the single authoritative
+        # clock for the age of the prefix actually used by the fast policy.
         self._streaming_state: _pi0.Pi0.StreamingState | None = None
         self._ring: _FrameRingBuffer | None = None
+        self._tick = 0  # monotonically increasing per-tick counter (RNG only, not a prefix clock)
 
         # Image resolution for flow (480x640 -> 60x80 grid).
         h, w = flow_config.flow_image_size
@@ -209,47 +211,65 @@ class FlowPiRuntime:
             num_steps=10,
             d=self._d,
         )
-        self._prefix_age = 0
+        self._tick = 0
+        # A new episode starts from a clean slow channel: drop any pending refresh of the
+        # previous episode.
+        with self._slow_lock:
+            self._pending_prefix = None
 
     def tick(self, observation: _model.Observation) -> np.ndarray:
         """One fast control tick (50 Hz): fresh state + online flow + one NFE.
 
-        Returns the ``d`` emitted actions (shape ``[d, action_dim]``).
+        A slow-channel refresh completed since the last tick is installed first (kv_cache +
+        prefix_mask swapped together, prefix_age reset to 0). Returns the ``d`` emitted actions
+        (shape ``[d, action_dim]``).
         """
+        # Install the latest completed slow-prefix refresh, if any, into the active streaming
+        # state. Publication is atomic: kv_cache and prefix_mask always come from the same
+        # prefix generation.
+        with self._slow_lock:
+            pending = self._pending_prefix
+            self._pending_prefix = None
+        state = self._streaming_state
+        if pending is not None:
+            state = dataclasses.replace(
+                state,
+                kv_cache=pending[0],
+                prefix_mask=pending[1],
+                prefix_age=jnp.zeros((state.action_buffer.shape[0],), dtype=jnp.int32),
+            )
+
         self._ingest_frame(observation)
         flow_data, flow_masks = self._compute_flow()
 
-        # Attach fresh flow and per-lag validity to the observation.
+        # Attach fresh flow, per-lag validity, and the slow-channel delay (age of the exact
+        # prefix stored in the streaming state; clamped so the embedding lookup stays in range).
         obs_with_flow = dataclasses.replace(
             observation,
             flow={cam: jnp.asarray(arr)[None, ...] for cam, arr in flow_data.items()},
             flow_masks={cam: jnp.asarray(mask)[None, ...] for cam, mask in flow_masks.items()},
-            vlm_delay=jnp.asarray([self._prefix_age], dtype=jnp.int32),
+            vlm_delay=jnp.minimum(state.prefix_age, self.flow_config.vlm_delay_max),
         )
 
-        # One NFE.
-        rng = jax.random.fold_in(jax.random.key(self._prefix_age), self._prefix_age)
-        emit, self._streaming_state = self.model.denoise_step(
-            self._streaming_state,
-            obs_with_flow,
-            rng,
-            d=self._d,
-        )
-
-        self._prefix_age += 1
+        # One NFE (per-tick RNG: must not repeat after a prefix refresh resets the age).
+        rng = jax.random.fold_in(jax.random.key(0), self._tick)
+        self._tick += 1
+        emit, new_state = self.model.denoise_step(state, obs_with_flow, rng, d=self._d)
+        self._streaming_state = new_state
         return np.asarray(emit[0])  # [d, action_dim]
 
     def refresh_prefix(self, observation: _model.Observation) -> None:
         """Slow-channel: re-run the VLM prefix encoder and produce fresh KV cache.
 
-        This should be called from a background thread (e.g. every N ticks).
+        The expensive computation happens outside the lock; the result is then published
+        atomically and installed into the active streaming state at the start of the next fast
+        tick (prefix_age resets to 0 only when that new prefix becomes active). Call from a
+        background thread (e.g. every N ticks).
         """
         observation = _model.preprocess_observation(None, observation, train=False)
         kv_cache, prefix_mask = self.model._prefix_forward(observation)  # noqa: SLF001
         with self._slow_lock:
-            self._kv_cache = kv_cache
-            self._prefix_mask = prefix_mask
-        self._prefix_age = 0
+            self._pending_prefix = (kv_cache, prefix_mask)
 
     def emit(self) -> np.ndarray:
         """Return the current action chunk (the first ``d`` actions in the buffer).

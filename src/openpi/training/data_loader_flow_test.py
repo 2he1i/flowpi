@@ -34,7 +34,14 @@ _ALOHA_REPACK = _transforms.Group(
 )
 
 
-def _make_train_config(mode: str, vlm_delay_max: int, flow_cache_dir: str | None = None):
+def _make_train_config(
+    mode: str,
+    vlm_delay_max: int,
+    flow_cache_dir: str | None = None,
+    *,
+    load_flow_cache: bool = True,
+    sample_vlm_delay: bool = True,
+):
     model = _pi0_config.Pi0Config(
         pi05=True,
         discrete_state_input=False,
@@ -57,6 +64,8 @@ def _make_train_config(mode: str, vlm_delay_max: int, flow_cache_dir: str | None
             sea_raft_ckpt=None,
             sea_raft_device=_DEVICE,
             sea_raft_allow_random_init=True,
+            load_flow_cache=load_flow_cache,
+            sample_vlm_delay=sample_vlm_delay,
         ),
     )
     return _config.TrainConfig(
@@ -116,6 +125,8 @@ def test_cache_roundtrip_matches_online(tmp_path):
         ],
         "num_flow_steps": 2,
         "flow_stride_frames": 3,
+        "flow_image_size": [480, 640],
+        "max_frames": None,
         "flow_cache_dir": cache_dir,
         "sea_raft_ckpt": None,
         "sea_raft_device": _DEVICE,
@@ -140,6 +151,38 @@ def test_cache_roundtrip_matches_online(tmp_path):
         for cam in online_sample["flow"]:
             np.testing.assert_allclose(cache_sample["flow"][cam], online_sample["flow"][cam], atol=0.1, rtol=0.1)
             np.testing.assert_array_equal(cache_sample["flow_masks"][cam], online_sample["flow_masks"][cam])
+
+
+def test_precompute_rejects_resolution_mismatch(tmp_path):
+    """The precompute worker must fail fast when the dataset resolution != flow_image_size
+    instead of silently writing a cache whose flow grid disagrees with the model."""
+    from scripts.precompute_flow_cache import _episode_entries
+    from scripts.precompute_flow_cache import _process_episode
+
+    entries = _episode_entries(_TEST_DATA)
+    cache_dir = str(tmp_path / "flow_cache")
+    task = {
+        "root": str(_TEST_DATA),
+        "entry": entries[0],
+        "cam_keys": [
+            "observation.images.cam_high",
+            "observation.images.cam_left_wrist",
+            "observation.images.cam_right_wrist",
+        ],
+        "num_flow_steps": 2,
+        "flow_stride_frames": 3,
+        "flow_image_size": [320, 240],  # wrong: dataset is 480x640
+        "max_frames": None,
+        "flow_cache_dir": cache_dir,
+        "sea_raft_ckpt": None,
+        "sea_raft_device": _DEVICE,
+        "sea_raft_allow_random_init": True,
+        "batch_size": 16,
+        "verbose": False,
+    }
+    with pytest.raises(ValueError, match="flow_image_size"):
+        _process_episode(task)
+    assert not pathlib.Path(cache_dir).exists() or not any(pathlib.Path(cache_dir).iterdir())
 
 
 def test_delay_slow_image_selection():
@@ -181,6 +224,41 @@ def test_delay_slow_image_selection():
     assert out3["images"]["cam"].shape == (3, h, w)
 
 
+def test_delay_slow_image_worker_aware_rng(monkeypatch):
+    """DataLoader workers must sample *uncorrelated* delays: torch forks the transform into each
+    worker process, so a fixed per-instance RNG stream would replay the identical delay sequence
+    in every worker. The stream must be derived from the worker id instead."""
+    import torch
+
+    frame_offsets = _transforms.compute_image_frame_offsets(num_flow_steps=2, flow_stride_frames=3, vlm_delay_max=4)
+    t_stack, h, w = len(frame_offsets), 4, 5
+    images = {f"cam_{i}": np.arange(t_stack * h * w * 3, dtype=np.uint8).reshape(t_stack, 3, h, w) for i in range(2)}
+    data = {"images": {k: v.copy() for k, v in images.items()}, "episode_index": 0, "frame_index": 13}
+
+    class FakeWorkerInfo:
+        def __init__(self, wid: int):
+            self.id = wid
+
+    def draw_sequence(worker_id: int, n: int = 32) -> list[int]:
+        transform = _transforms.DelaySlowImage(4, frame_offsets, seed=7)
+        monkeypatch.setattr(torch.utils.data, "get_worker_info", lambda: FakeWorkerInfo(worker_id))
+        return [transform(dict(data))["vlm_delay"] for _ in range(n)]
+
+    worker0 = draw_sequence(0)
+    worker1 = draw_sequence(1)
+    worker2 = draw_sequence(2)
+
+    # Different workers must not replay the same delay sequence (cross-worker correlation).
+    assert worker0 != worker1, "worker 0 and worker 1 drew identical delays"
+    assert worker0 != worker2, "worker 0 and worker 2 drew identical delays"
+    # Each worker's sequence is still stochastic and stays within the allowed range.
+    for seq in (worker0, worker1, worker2):
+        assert all(0 <= d <= 4 for d in seq)
+        assert len(set(seq)) >= 3, f"worker sequence has no diversity: {seq}"
+    # Seeded determinism is preserved: same seed + same worker id reproduces the sequence.
+    assert draw_sequence(0) == worker0
+
+
 def test_flow_disabled_matches_baseline():
     model = _pi0_config.Pi0Config(pi05=True, discrete_state_input=False)
     baseline = _config.LeRobotAlohaDataConfig(
@@ -197,6 +275,97 @@ def test_flow_disabled_matches_baseline():
     assert "frame_index" not in sample
     assert sample["image"]["base_0_rgb"].shape == (224, 224, 3)
     assert sample["actions"].shape == (50, 32)
+
+
+def test_ablation_data_stream_semantics(tmp_path):
+    """The ablation configs must decouple the *data stream* from the *model channels*: B/C
+    (load_flow_cache=False + sample_vlm_delay=False) keep the exact π0.5 single-frame stream
+    (no camera history, no vlm_delay, no flow); D (delay only) samples vlm_delay without the
+    flow cache; E (full) keeps both. Regression: B/C previously still applied DelaySlowImage
+    and loaded the flow cache, contaminating the ablation with a delayed-image shift."""
+    # Build a real flow cache so the E config's LoadFlowCache has something to load.
+    from scripts.precompute_flow_cache import _episode_entries
+    from scripts.precompute_flow_cache import _process_episode
+
+    entries = _episode_entries(_TEST_DATA)
+    cache_dir = str(tmp_path / "flow_cache")
+    task = {
+        "root": str(_TEST_DATA),
+        "entry": entries[0],
+        "cam_keys": [
+            "observation.images.cam_high",
+            "observation.images.cam_left_wrist",
+            "observation.images.cam_right_wrist",
+        ],
+        "num_flow_steps": 2,
+        "flow_stride_frames": 3,
+        "flow_image_size": [480, 640],
+        "max_frames": None,
+        "flow_cache_dir": cache_dir,
+        "sea_raft_ckpt": None,
+        "sea_raft_device": _DEVICE,
+        "sea_raft_allow_random_init": True,
+        "batch_size": 16,
+        "verbose": False,
+    }
+    _process_episode(task)
+
+    # Write the meta file that LoadFlowCache validates.
+    import json
+
+    with open(pathlib.Path(cache_dir) / "meta.json", "w") as f:
+        json.dump({"num_flow_steps": 2, "flow_stride_frames": 3, "image_size": [480, 640]}, f)
+
+    # B/C data stream: π0.5-identical (fresh image, no delay, no camera history).
+    bc = _make_train_config("cache", vlm_delay_max=4, load_flow_cache=False, sample_vlm_delay=False)
+    bc_created = bc.data.create(bc.assets_dirs, bc.model)
+    assert not any(
+        isinstance(t, _transforms.DelaySlowImage | _transforms.LoadFlowCache) for t in bc_created.data_transforms.inputs
+    )
+    sample = _get_sample(bc, 10)
+    assert "vlm_delay" not in sample
+    assert "flow" not in sample
+    assert "flow_masks" not in sample
+    assert "episode_index" not in sample
+    assert "frame_index" not in sample
+    assert sample["image"]["base_0_rgb"].shape == (224, 224, 3)
+
+    # D data stream: delay only (vlm_delay sampled from the stacked history, no flow cache).
+    d = _make_train_config("cache", vlm_delay_max=4, load_flow_cache=False, sample_vlm_delay=True)
+    d_created = d.data.create(d.assets_dirs, d.model)
+    assert any(isinstance(t, _transforms.DelaySlowImage) for t in d_created.data_transforms.inputs)
+    assert not any(isinstance(t, _transforms.LoadFlowCache) for t in d_created.data_transforms.inputs)
+    sample = _get_sample(d, 10)
+    assert "vlm_delay" in sample
+    assert 0 <= sample["vlm_delay"] <= 4
+    assert "flow" not in sample
+    assert sample["image"]["base_0_rgb"].shape == (224, 224, 3)
+
+    # E data stream: full pipeline (flow cache + delay).
+    e = _make_train_config("cache", vlm_delay_max=4, flow_cache_dir=cache_dir, sample_vlm_delay=True)
+    e_created = e.data.create(e.assets_dirs, e.model)
+    assert any(isinstance(t, _transforms.DelaySlowImage) for t in e_created.data_transforms.inputs)
+    assert any(isinstance(t, _transforms.LoadFlowCache) for t in e_created.data_transforms.inputs)
+    sample = _get_sample(e, 10)
+    assert "vlm_delay" in sample
+    assert 0 <= sample["vlm_delay"] <= 4
+    assert "flow" in sample
+
+    # The ablation config table wires the toggles correctly (B/C off/off, D off/on, E on/on).
+    from openpi.training.config import _flowpi_ablation_configs
+
+    by_name = {c.name: c for c in _flowpi_ablation_configs()}
+    for name in ("flowpi_abl_b_fresh_state", "flowpi_abl_c_pir2"):
+        flow = by_name[name].data.flow
+        assert flow is not None
+        assert not flow.load_flow_cache
+        assert not flow.sample_vlm_delay
+    d_flow = by_name["flowpi_abl_d_delay"].data.flow
+    assert not d_flow.load_flow_cache
+    assert d_flow.sample_vlm_delay
+    e_flow = by_name["flowpi_abl_e_flow"].data.flow
+    assert e_flow.load_flow_cache
+    assert e_flow.sample_vlm_delay
 
 
 def test_load_flow_cache_lru_eviction(tmp_path):

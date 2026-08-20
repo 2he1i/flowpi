@@ -314,7 +314,10 @@ class Pi0(_model.BaseModel):
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng, mix_rng = jax.random.split(rng, 4)
-        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        geometric_aug = True if self.flow_config is None else self.flow_config.image_geometric_aug
+        observation = _model.preprocess_observation(
+            preprocess_rng, observation, train=train, geometric_aug=geometric_aug
+        )
 
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)

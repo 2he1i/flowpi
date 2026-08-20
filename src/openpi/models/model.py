@@ -160,9 +160,15 @@ def preprocess_observation(
     train: bool = False,
     image_keys: Sequence[str] = IMAGE_KEYS,
     image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
+    geometric_aug: bool = True,
 ) -> Observation:
     """Preprocess the observations by performing image augmentations (if train=True), resizing (if necessary), and
     filling in a default image mask (if necessary).
+
+    ``geometric_aug`` gates the spatial augmentations (RandomCrop / Rotate) on non-wrist cameras.
+    FlowPi disables them by default: the flow cache is computed offline on the raw frames, so
+    spatially augmenting the VLM image would put the image and the flow in different coordinate
+    systems. Photometric augmentation (ColorJitter) is always applied for non-wrist cameras too.
     """
 
     if not set(image_keys).issubset(observation.images):
@@ -184,7 +190,7 @@ def preprocess_observation(
             image = image / 2.0 + 0.5
 
             transforms = []
-            if "wrist" not in key:
+            if "wrist" not in key and geometric_aug:
                 height, width = image.shape[1:3]
                 transforms += [
                     augmax.RandomCrop(int(width * 0.95), int(height * 0.95)),

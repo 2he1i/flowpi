@@ -98,12 +98,29 @@ def _process_episode(task: dict) -> dict:
     entry = task["entry"]
     k_num, stride, batch_size = task["num_flow_steps"], task["flow_stride_frames"], task["batch_size"]
 
-    ep_dir = pathlib.Path(task["flow_cache_dir"]) / f"episode-{entry['episode_index']:06d}"
-    ep_dir.mkdir(parents=True, exist_ok=True)
-
     frames = _decode_episode_frames(root, entry, task["cam_keys"])
+    if task.get("max_frames") is not None:
+        frames = {cam: arr[: task["max_frames"]] for cam, arr in frames.items()}
     t_len = next(iter(frames.values())).shape[0]
     _, _, height, width = next(iter(frames.values())).shape
+
+    # Fail fast instead of writing a cache whose flow grid silently disagrees with the model:
+    # SEA-RAFT downsamples by 8, so the cached flow is (H//8, W//8) of *this* frame size. The
+    # meta.json records the actual input size, and LoadFlowCache._validate_meta() checks it
+    # against flow_image_size at load time. Do NOT resize here: silently resampling the dataset
+    # would hide a resolution mismatch between the dataset and the training config. Checked
+    # before creating the episode dir so a mismatch leaves no partial cache behind.
+    expected = tuple(task["flow_image_size"])
+    if (height, width) != expected:
+        raise ValueError(
+            f"Episode {entry['episode_index']}: dataset frames are {height}x{width} but "
+            f"flow_image_size is {expected[0]}x{expected[1]}. The cached flow grid would not "
+            "match the model's flow tokenizer. Configure flow_image_size to the dataset "
+            "resolution or resize the dataset."
+        )
+
+    ep_dir = pathlib.Path(task["flow_cache_dir"]) / f"episode-{entry['episode_index']:06d}"
+    ep_dir.mkdir(parents=True, exist_ok=True)
 
     valid = np.zeros((t_len, k_num), dtype=bool)
     pairs = []  # (t, k, cam)
@@ -128,7 +145,11 @@ def _process_episode(task: dict) -> dict:
     for cam in task["cam_keys"]:
         np.save(ep_dir / f"{_cache_name(cam)}.npy", flows[cam])
     np.save(ep_dir / "valid.npy", valid)
-    return {"episode": entry["episode_index"], "num_pairs": len(pairs)}
+    return {
+        "episode": entry["episode_index"],
+        "num_pairs": len(pairs),
+        "image_size": [height, width],
+    }
 
 
 def main():
@@ -181,6 +202,8 @@ def main():
             "cam_keys": cam_keys,
             "num_flow_steps": model_flow.num_flow_steps,
             "flow_stride_frames": model_flow.flow_stride_frames,
+            "flow_image_size": list(model_flow.flow_image_size),
+            "max_frames": extra.max_frames,
             "flow_cache_dir": str(cache_dir),
             "sea_raft_ckpt": flow_cfg.sea_raft_ckpt,
             "sea_raft_device": flow_cfg.sea_raft_device,
@@ -200,7 +223,8 @@ def main():
     meta = {
         "num_flow_steps": model_flow.num_flow_steps,
         "flow_stride_frames": model_flow.flow_stride_frames,
-        "image_size": list(model_flow.flow_image_size),
+        # The actual frame size fed to SEA-RAFT (validated == flow_image_size in the workers).
+        "image_size": results[0]["image_size"],
         "fps": info["fps"],
         "sea_raft_ckpt": flow_cfg.sea_raft_ckpt,
         "sea_raft_variant": "M",

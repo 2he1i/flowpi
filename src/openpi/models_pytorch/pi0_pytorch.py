@@ -86,6 +86,7 @@ class PI0Pytorch(nn.Module):
         super().__init__()
         self.config = config
         self.pi05 = config.pi05
+        self.flow_config = config.flow if (config.flow is not None and config.flow.enabled) else None
 
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
@@ -161,7 +162,10 @@ class PI0Pytorch(nn.Module):
 
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
-        observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
+        geometric_aug = True if self.flow_config is None else self.flow_config.image_geometric_aug
+        observation = _preprocessing.preprocess_observation_pytorch(
+            observation, train=train, geometric_aug=geometric_aug
+        )
         return (
             list(observation.images.values()),
             list(observation.image_masks.values()),

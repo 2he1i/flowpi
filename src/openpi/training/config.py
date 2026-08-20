@@ -66,6 +66,14 @@ class FlowDataConfig:
     """Data-pipeline configuration for the flow fast-path.
 
     K / Δ / vlm_delay_max / flow scale / clamp are read from `model.flow` (single source of truth).
+
+    The two toggles decouple *loading the flow cache* from *simulating the VLM delay* so the
+    ablation configs stay clean cumulative ablations:
+      - ``load_flow_cache=False``  -> no flow transform, no camera history
+      - ``sample_vlm_delay=False`` -> no DelaySlowImage (the VLM image is the current frame)
+    Both default True (the full FlowPi pipeline). An ablation that only adds the fresh-state /
+    πR² / delay channels therefore keeps the exact π0.5 data stream for every channel it does
+    not add.
     """
 
     enabled: bool = True
@@ -75,6 +83,10 @@ class FlowDataConfig:
     sea_raft_device: str = "cpu"
     # Opt-in for random SEA-RAFT weights (tests/smoke runs only); production must pass a checkpoint.
     sea_raft_allow_random_init: bool = False
+    # Include the flow transform (LoadFlowCache/ComputeFlow) and the camera history it needs.
+    load_flow_cache: bool = True
+    # Include the DelaySlowImage transform (stale VLM image simulation).
+    sample_vlm_delay: bool = True
 
 
 @dataclasses.dataclass(frozen=True)
@@ -301,59 +313,68 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
             frame_offsets = _transforms.compute_image_frame_offsets(
                 model_flow.num_flow_steps, model_flow.flow_stride_frames, model_flow.vlm_delay_max
             )
-            if self.flow.mode == "online":
-                from openpi.training.sea_raft import SeaRaftFlowExtractor
+            flow_transforms: list[_transforms.DataTransformFn] = []
+            if self.flow.load_flow_cache:
+                if self.flow.mode == "online":
+                    from openpi.training.sea_raft import SeaRaftFlowExtractor
 
-                extractor = SeaRaftFlowExtractor(
-                    ckpt_path=self.flow.sea_raft_ckpt or None,
-                    variant="M",
-                    device=self.flow.sea_raft_device,
-                    allow_random_init=self.flow.sea_raft_allow_random_init,
-                )
-                flow_transform: _transforms.DataTransformFn = _transforms.ComputeFlow(
-                    extractor,
-                    cam_keys,
-                    num_flow_steps=model_flow.num_flow_steps,
-                    flow_stride_frames=model_flow.flow_stride_frames,
-                    flow_scale=model_flow.flow_scale,
-                    flow_clamp=model_flow.flow_clamp,
-                    frame_offsets=frame_offsets,
-                )
-            else:
-                if self.flow.flow_cache_dir is None:
-                    raise ValueError("--data.flow.mode=cache requires --data.flow.flow-cache-dir.")
-                flow_transform = _transforms.LoadFlowCache(
-                    self.flow.flow_cache_dir,
-                    cam_keys,
-                    num_flow_steps=model_flow.num_flow_steps,
-                    flow_stride_frames=model_flow.flow_stride_frames,
-                    flow_image_size=model_flow.flow_image_size,
-                    flow_scale=model_flow.flow_scale,
-                    flow_clamp=model_flow.flow_clamp,
-                )
-            delay_transform = _transforms.DelaySlowImage(model_flow.vlm_delay_max, frame_offsets, seed=0)
-            data_transforms = _transforms.Group(
-                inputs=[flow_transform, delay_transform, *data_transforms.inputs],
-                outputs=data_transforms.outputs,
-            )
-            # The flow transforms need episode/frame indices to address the cache and validity.
-            # Merge them into the main repack structure (RepackTransform drops unmapped keys).
-            repack_transforms = _transforms.Group(
-                inputs=tuple(
-                    dataclasses.replace(
-                        transform,
-                        structure={
-                            **transform.structure,
-                            "episode_index": "episode_index",
-                            "frame_index": "frame_index",
-                        },
+                    extractor = SeaRaftFlowExtractor(
+                        ckpt_path=self.flow.sea_raft_ckpt or None,
+                        variant="M",
+                        device=self.flow.sea_raft_device,
+                        allow_random_init=self.flow.sea_raft_allow_random_init,
                     )
-                    if isinstance(transform, _transforms.RepackTransform)
-                    else transform
-                    for transform in repack_transforms.inputs
-                ),
-                outputs=repack_transforms.outputs,
-            )
+                    flow_transforms.append(
+                        _transforms.ComputeFlow(
+                            extractor,
+                            cam_keys,
+                            num_flow_steps=model_flow.num_flow_steps,
+                            flow_stride_frames=model_flow.flow_stride_frames,
+                            flow_scale=model_flow.flow_scale,
+                            flow_clamp=model_flow.flow_clamp,
+                            frame_offsets=frame_offsets,
+                        )
+                    )
+                else:
+                    if self.flow.flow_cache_dir is None:
+                        raise ValueError("--data.flow.mode=cache requires --data.flow.flow-cache-dir.")
+                    flow_transforms.append(
+                        _transforms.LoadFlowCache(
+                            self.flow.flow_cache_dir,
+                            cam_keys,
+                            num_flow_steps=model_flow.num_flow_steps,
+                            flow_stride_frames=model_flow.flow_stride_frames,
+                            flow_image_size=model_flow.flow_image_size,
+                            flow_scale=model_flow.flow_scale,
+                            flow_clamp=model_flow.flow_clamp,
+                        )
+                    )
+            if self.flow.sample_vlm_delay:
+                flow_transforms.append(_transforms.DelaySlowImage(model_flow.vlm_delay_max, frame_offsets, seed=0))
+            if flow_transforms:
+                data_transforms = _transforms.Group(
+                    inputs=[*flow_transforms, *data_transforms.inputs],
+                    outputs=data_transforms.outputs,
+                )
+                # The flow/delay transforms need episode/frame indices to address the cache and
+                # the stacked camera history. Merge them into the main repack structure
+                # (RepackTransform drops unmapped keys).
+                repack_transforms = _transforms.Group(
+                    inputs=tuple(
+                        dataclasses.replace(
+                            transform,
+                            structure={
+                                **transform.structure,
+                                "episode_index": "episode_index",
+                                "frame_index": "frame_index",
+                            },
+                        )
+                        if isinstance(transform, _transforms.RepackTransform)
+                        else transform
+                        for transform in repack_transforms.inputs
+                    ),
+                    outputs=repack_transforms.outputs,
+                )
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
@@ -657,7 +678,13 @@ def _flowpi_ablation_configs() -> tuple[TrainConfig, ...]:
     """Builds the flowpi ablation configs A-E (see the comment above the config list)."""
 
     def make(
-        name: str, exp_name: str, flow: pi0_config.FlowConfig | None, *, discrete_state_input: bool
+        name: str,
+        exp_name: str,
+        flow: pi0_config.FlowConfig | None,
+        *,
+        discrete_state_input: bool,
+        load_flow_cache: bool = True,
+        sample_vlm_delay: bool = True,
     ) -> TrainConfig:
         model = pi0_config.Pi0Config(
             pi05=True,
@@ -671,6 +698,8 @@ def _flowpi_ablation_configs() -> tuple[TrainConfig, ...]:
                 flow_cache_dir="<your-flow-cache-dir>",
                 sea_raft_ckpt="<your-sea-raft-ckpt>",
                 sea_raft_device="cuda",
+                load_flow_cache=load_flow_cache,
+                sample_vlm_delay=sample_vlm_delay,
             )
             if flow is not None
             else None
@@ -716,23 +745,32 @@ def _flowpi_ablation_configs() -> tuple[TrainConfig, ...]:
             None,
             discrete_state_input=True,
         ),
+        # B/C disable both the flow cache and the VLM-delay simulation: the data stream is the
+        # exact π0.5 baseline (fresh image), so B measures fresh-state and C measures πR² in
+        # isolation. Only D (delay) and E (flow) consume the delayed-image / camera-history
+        # pipeline. This keeps A ⊂ B ⊂ C ⊂ D ⊂ E a clean cumulative ablation.
         make(
             "flowpi_abl_b_fresh_state",
             "flowpi_abl_b_fresh_state",
             pi0_config.FlowConfig(use_delay=False, use_flow=False, use_pir2=False),
             discrete_state_input=False,
+            load_flow_cache=False,
+            sample_vlm_delay=False,
         ),
         make(
             "flowpi_abl_c_pir2",
             "flowpi_abl_c_pir2",
             pi0_config.FlowConfig(use_delay=False, use_flow=False),
             discrete_state_input=False,
+            load_flow_cache=False,
+            sample_vlm_delay=False,
         ),
         make(
             "flowpi_abl_d_delay",
             "flowpi_abl_d_delay",
             pi0_config.FlowConfig(use_flow=False),
             discrete_state_input=False,
+            load_flow_cache=False,
         ),
         make(
             "flowpi_abl_e_flow",
@@ -1236,10 +1274,14 @@ _CONFIGS = [
     # seed. The `use_*` toggles gate a channel's *use* without changing the parameter layout,
     # so B-E also share one architecture and one checkpoint format.
     #
+    # The ablation is a clean cumulative stack: B/C keep the exact π0.5 data stream (fresh
+    # image, no camera history, no simulated VLM delay); only D introduces the delayed-image
+    # simulation and only E adds the flow cache:
+    #
     #   A: π0.5 matched baseline          (flow=None: exactly the π0.5 architecture)
     #   B: + fresh state                 (flow_state_proj state token, every NFE)
     #   C: + πR²                         (staircase per-position noise)
-    #   D: + delay                       (flow_vlm_delay_fast adaRMS conditioning)
+    #   D: + delay                       (flow_vlm_delay_fast adaRMS conditioning + DelaySlowImage)
     #   E: + flow                        (= flowpi_aloha, the full model)
     #
     *(_flowpi_ablation_configs()),

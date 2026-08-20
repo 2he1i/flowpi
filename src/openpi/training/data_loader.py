@@ -143,9 +143,11 @@ def create_torch_dataset(
         key: [t / dataset_fps(repo_id) for t in range(action_horizon)] for key in data_config.action_sequence_keys
     }
 
-    # Load camera history frames for the flow fast-path / slow-channel delay window.
+    # Load camera history frames for the flow fast-path / slow-channel delay window. Only
+    # needed when at least one of the flow/delay transforms is active (ablation configs turn
+    # both off, keeping the exact π0.5 single-frame image stream).
     flow = data_config.flow
-    if flow is not None and flow.enabled:
+    if flow is not None and flow.enabled and (flow.load_flow_cache or flow.sample_vlm_delay):
         model_flow = getattr(model_config, "flow", None)
         if model_flow is None or not model_flow.enabled:
             raise ValueError("data.flow.enabled requires model.flow to be enabled.")

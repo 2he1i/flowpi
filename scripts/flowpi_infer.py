@@ -10,10 +10,20 @@ them and lets the model preprocess the same observation for the VLM. `ResizeImag
 dropped from the runtime data config's model transforms — the model preprocessor resizes to
 224x224 internally, identically to the training pipeline.
 
+Two replay modes:
+
+- *functional* (default): no wall-clock pacing; a tick is as fast as the hardware allows.
+- *realtime* (``--realtime``): ticks are paced to a fixed control period (``--control-hz``), so
+  one tick is a physical 20 ms at 50 Hz and the measured delays are in real milliseconds. This
+  is the mode to use for deployment-equivalent timing / freshness measurements.
+
+Actions are saved in *robot-executable* space (unnormalized + the data config's output
+transforms, e.g. AbsoluteActions + AlohaOutputs), matching the policy server's output pipeline.
+
 Usage:
     uv run python scripts/flowpi_infer.py --config-name flowpi_aloha \
         --checkpoint /path/to/checkpoint --dataset data/adjust_bottle_ep0 \
-        --slow-every-n 10
+        --slow-every-n 10 [--realtime --control-hz 50]
 """
 
 import argparse
@@ -40,6 +50,14 @@ def main():
     parser.add_argument("--slow-every-n", type=int, default=10, help="Prefix refresh interval (ticks)")
     parser.add_argument("--max-frames", type=int, default=None, help="Limit the number of frames")
     parser.add_argument("--skip-normalization", action="store_true", help="Skip state normalization (debug only)")
+    parser.add_argument(
+        "--realtime",
+        action="store_true",
+        help="Pace ticks to a fixed control period (wall clock) instead of running as fast as possible.",
+    )
+    parser.add_argument("--control-hz", type=float, default=50.0, help="Control frequency in realtime mode (Hz)")
+    parser.add_argument("--jax-device", type=str, default=None, help="JAX model device (e.g. cuda:0 / gpu:1)")
+    parser.add_argument("--sea-raft-device", type=str, default=None, help="SEA-RAFT torch device (e.g. cuda:0)")
     args = parser.parse_args()
 
     # Load the config and create the model.
@@ -87,16 +105,35 @@ def main():
     if args.max_frames is not None:
         frame_count = min(frame_count, args.max_frames)
 
+    # Robot-executable output pipeline, mirroring the policy server: unnormalize the model-space
+    # actions, then invert the data output transforms (e.g. AbsoluteActions + AlohaOutputs).
+    # Only meaningful when normalization was applied; with --skip-normalization the raw
+    # model-space actions are saved (debug only).
+    output_transform = None
+    if not args.skip_normalization and data_config.norm_stats is not None:
+        output_transform = _transforms.compose(
+            [
+                _transforms.Unnormalize(data_config.norm_stats, use_quantiles=data_config.use_quantile_norm),
+                *data_config.data_transforms.outputs,
+            ]
+        )
+
     # Build the runtime (fails fast when no SEA-RAFT checkpoint is configured).
+    sea_raft_device = args.sea_raft_device or (data_config.flow.sea_raft_device if data_config.flow else "cpu")
     runtime = flowpi_runtime.FlowPiRuntime(
         model,
         flow_config=flow_cfg,
         sea_raft_ckpt=data_config.flow.sea_raft_ckpt if data_config.flow else None,
-        sea_raft_device=data_config.flow.sea_raft_device if data_config.flow else "cpu",
+        sea_raft_device=sea_raft_device,
+        jax_device=args.jax_device,
         d=1,
     )
 
     all_actions = []
+    # (actions, normalized state) pairs; the state is needed by the output transforms to
+    # invert the delta/absolute repack.
+    all_outputs: list[tuple[np.ndarray, np.ndarray]] = []
+    period = 1.0 / args.control_hz
 
     for frame_idx, batch in enumerate(loader):
         if frame_idx >= frame_count:
@@ -109,14 +146,24 @@ def main():
             runtime.warm_start(obs)
             runtime.refresh_prefix(obs, wait=True)
             # Emit the initial in-flight actions.
-            all_actions.append(runtime.emit())
+            emit = runtime.emit()
+            all_actions.append(emit)
+            all_outputs.append((emit, np.asarray(obs.state[0])))
             continue
 
-        # Fast tick.
+        # Fast tick (paced to the control period in realtime mode).
+        loop_t0 = time.perf_counter()
         t0 = time.perf_counter()
         acts = runtime.tick(obs)
         runtime.stats["tick_total_ms"].append((time.perf_counter() - t0) * 1000)
         all_actions.append(acts)
+        all_outputs.append((acts, np.asarray(obs.state[0])))
+
+        if args.realtime:
+            elapsed = time.perf_counter() - loop_t0
+            if elapsed < period:
+                time.sleep(period - elapsed)
+        runtime.stats["tick_wall_ms"].append((time.perf_counter() - loop_t0) * 1000)
 
         # Slow-channel refresh (async: the prefill runs in the background and is installed at
         # the next fast tick, so the replay loop never blocks on the VLM).
@@ -126,19 +173,41 @@ def main():
     # Drain the slow worker and propagate any prefill exception to the main thread.
     runtime.close()
 
-    # Save actions.
+    # Post-process the actions into robot-executable space (unnormalized + output transforms).
     actions_np = np.concatenate(all_actions, axis=0)
+    if output_transform is not None:
+        processed = [
+            output_transform({"actions": np.asarray(acts), "state": state})["actions"] for acts, state in all_outputs
+        ]
+        actions_np = np.concatenate([np.asarray(out) for out in processed], axis=0)
+    else:
+        print("WARNING: --skip-normalization: saving raw model-space actions (debug only)")
+
     out_path = pathlib.Path(args.checkpoint) / "replay_actions.npz"
     np.savez(out_path, actions=actions_np)
     print(f"Saved {len(all_actions)} actions to {out_path}")
 
-    # Print timing stats (f_fast / f_slow / d_VLM distributions).
+    # Timing stats (f_fast / f_slow / d_VLM distributions).
     for name, vals in runtime.stats.items():
         if vals:
             arr = np.array(vals)
             print(f"{name}: mean={arr.mean():.1f}ms, min={arr.min():.1f}ms, max={arr.max():.1f}ms, n={len(arr)}")
     if runtime.num_generation_drops:
         print(f"dropped prefix generations: {runtime.num_generation_drops}")
+
+    # Freshness telemetry: reconstruct Age_VLM (ticks and ms) from the per-tick source ticks.
+    if runtime.telemetry:
+        ticks = np.array([t["tick"] for t in runtime.telemetry])
+        prefix_src = np.array([t["prefix_source_tick"] for t in runtime.telemetry])
+        delays = np.array([t["delay_ticks"] for t in runtime.telemetry])
+        print(
+            f"freshness: ticks={len(ticks)}, "
+            f"prefix_source_tick last={prefix_src[-1]} (of tick {ticks[-1]}), "
+            f"age_ticks mean={delays.mean():.2f} max={delays.max()} (d_max={flow_cfg.vlm_delay_max})"
+        )
+    if runtime.stats.get("prefix_age_ms_at_install"):
+        arr = np.array(runtime.stats["prefix_age_ms_at_install"])
+        print(f"prefix_age_ms_at_install: mean={arr.mean():.1f}ms, max={arr.max():.1f}ms, n={len(arr)}")
 
 
 if __name__ == "__main__":

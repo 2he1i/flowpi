@@ -23,8 +23,14 @@ def preprocess_observation_pytorch(
     train: bool = False,
     image_keys: Sequence[str] = IMAGE_KEYS,
     image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
+    geometric_aug: bool = True,
 ):
     """Torch.compile-compatible version of preprocess_observation_pytorch with simplified type annotations.
+
+    ``geometric_aug`` gates the spatial augmentations (RandomCrop / Rotate) on non-wrist cameras.
+    FlowPi disables them by default: the flow cache is computed offline on the raw frames, so
+    spatially augmenting the VLM image would put the image and the flow in different coordinate
+    systems. Photometric augmentation (ColorJitter) is always applied for non-wrist cameras too.
 
     This function avoids complex type annotations that can cause torch.compile issues.
     """
@@ -54,7 +60,7 @@ def preprocess_observation_pytorch(
             image = image / 2.0 + 0.5
 
             # Apply PyTorch-based augmentations
-            if "wrist" not in key:
+            if "wrist" not in key and geometric_aug:
                 # Geometric augmentations for non-wrist cameras
                 height, width = image.shape[1:3]
 

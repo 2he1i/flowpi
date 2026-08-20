@@ -50,6 +50,12 @@ class FlowConfig:
     use_delay: bool = True  # flow_vlm_delay_fast adaRMS conditioning.
     use_flow: bool = True  # flow tokenizer + FlowGeom cross-attention.
     use_pir2: bool = True  # πR² staircase noise; False falls back to baseline β(t) noise.
+    # Image augmentation strategy during training. The flow cache is computed offline on the raw
+    # frames, so any geometric augmentation of the VLM image (RandomCrop / Rotate) would put the
+    # image and the flow in different coordinate systems. Default (False) keeps only photometric
+    # augmentation (ColorJitter) for flowpi models; set to True to opt back into the upstream
+    # geometric augmentation at the cost of that spatial mismatch.
+    image_geometric_aug: bool = False
 
     def __post_init__(self):
         if self.injection_layers is None:
@@ -130,14 +136,14 @@ class Pi0Config(_model.BaseModelConfig):
                 "max-autotune-no-cudagraphs",
             ]
         if self.flow is not None and self.flow.enabled:
-            assert (
-                self.flow.d_max < self.action_horizon / 2
-            ), f"flow.d_max ({self.flow.d_max}) must be < action_horizon/2 ({self.action_horizon / 2})"
+            assert self.flow.d_max < self.action_horizon / 2, (
+                f"flow.d_max ({self.flow.d_max}) must be < action_horizon/2 ({self.action_horizon / 2})"
+            )
             depth = _gemma.get_config(self.action_expert_variant).depth
             for layer in self.flow.injection_layers:
-                assert (
-                    0 <= layer < depth
-                ), f"flow injection layer {layer} is out of range for action expert depth {depth}"
+                assert 0 <= layer < depth, (
+                    f"flow injection layer {layer} is out of range for action expert depth {depth}"
+                )
 
     @property
     @override

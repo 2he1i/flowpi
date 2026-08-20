@@ -115,9 +115,10 @@ def _resolve_checkpoint_path(checkpoint_path: str) -> str:
 
     Accepts (in order of preference):
     - a released checkpoint (e.g. ``gs://.../pi05_base/params`` or ``.../params``),
-    - an orbax training step directory (``<dir>/step_000123``),
+    - an orbax training step directory (``<dir>/step_000123`` or a numeric ``<dir>/123``),
     - a training checkpoint root with a ``latest`` symlink (``<dir>/latest -> step_...``),
-    - a step directory's ``params`` item (``<dir>/step_000123/params``).
+    - a step directory's ``params`` item (``<dir>/step_000123/params``),
+    - an orbax CheckpointManager root with numeric step dirs (``<dir>/<step>/params``).
     """
     if str(checkpoint_path).startswith("gs://"):
         return str(checkpoint_path)
@@ -130,6 +131,21 @@ def _resolve_checkpoint_path(checkpoint_path: str) -> str:
     for candidate in candidates:
         if (candidate / "metadata.json").exists():
             return str(candidate)
+    if path.is_dir():
+        # The path itself is an orbax step dir (<step>/params + train_state + assets): resolve
+        # its params item.
+        if (path / "_CHECKPOINT_METADATA").exists() and (path / "params").is_dir():
+            return str(path / "params")
+        # Orbax CheckpointManager root: <root>/<step>/params (+ train_state, assets,
+        # _CHECKPOINT_METADATA). Pick the largest numeric step with a restorable params item so
+        # a checkpoint root resolves without hand-writing the step number.
+        steps = sorted(
+            (d for d in path.iterdir() if d.name.isdigit() and (d / "params").is_dir()),
+            key=lambda d: int(d.name),
+            reverse=True,
+        )
+        if steps:
+            return str(steps[0] / "params")
     # No metadata found; let `restore_params` raise the precise error.
     return str(path)
 

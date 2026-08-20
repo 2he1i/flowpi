@@ -4,6 +4,9 @@ checkpoints/
 data/
 wandb/
 
+# Local opencode config (permission auto-approve rules, machine-specific).
+opencode.json
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

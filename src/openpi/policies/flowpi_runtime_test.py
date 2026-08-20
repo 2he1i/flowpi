@@ -314,9 +314,9 @@ def test_cross_episode_prefix_is_dropped():
         runtime.tick(_obs_for(0.25, 1))
         assert runtime._prefix_source_tick == 0  # noqa: SLF001
         kv_now = jax.tree.leaves(runtime._streaming_state.kv_cache)  # noqa: SLF001
-        assert all(
-            np.array_equal(np.asarray(a), np.asarray(b)) for a, b in zip(kv_now, kv_old, strict=True)
-        ), "stale episode prefix was installed"
+        assert all(np.array_equal(np.asarray(a), np.asarray(b)) for a, b in zip(kv_now, kv_old, strict=True)), (
+            "stale episode prefix was installed"
+        )
         assert runtime.num_generation_drops >= 1
     finally:
         runtime.close()
@@ -350,5 +350,67 @@ def test_resized_frames_raise_flow_grid_error():
         runtime.warm_start(_obs_for(0.25, 0, h=224, w=224))
         with pytest.raises(ValueError, match="flow grid"):
             runtime.tick(_obs_for(0.25, 1, h=224, w=224))
+    finally:
+        runtime.close()
+
+
+def test_refresh_storm_coalesces_and_never_starves():
+    """A refresh storm (requests arriving faster than the VLM prefill rate) must not starve the
+    prefix: requests coalesce into a single latest-pending mailbox slot, the worker publishes
+    every completed generation that is fresher than the pending one, and the installed prefix
+    source tick advances monotonically to the last submitted refresh (regression: the old
+    "only the latest generation may publish" scheme dropped every in-flight prefill and left
+    the prefix frozen)."""
+    runtime = _make_runtime()
+    original_prefill = runtime._prefill  # noqa: SLF001
+
+    def slow_prefill(observation):
+        # Slow the VLM down so the refresh rate in the test exceeds the service rate.
+        time.sleep(0.02)
+        return original_prefill(observation)
+
+    runtime._prefill = slow_prefill  # noqa: SLF001
+    try:
+        runtime.warm_start(_obs_for(0.25, 0))
+        runtime.tick(_obs_for(0.25, 1))
+        assert runtime._prefix_source_tick == 0  # noqa: SLF001
+
+        # Storm: fast ticks interleaved with async refreshes — the refresh rate (one per tick)
+        # exceeds the VLM service rate, so the requests must coalesce into the mailbox.
+        n_storm = 25
+        for i in range(2, 2 + n_storm):
+            runtime.tick(_obs_for(0.25, i))
+            runtime.refresh_prefix(_obs_for(0.25, i), wait=False)
+
+        # The mailbox is bounded: it holds at most the *latest* pending request, never a backlog
+        # of intermediate ones.
+        with runtime._slow_lock:  # noqa: SLF001
+            mailbox = runtime._slow_mailbox  # noqa: SLF001
+        assert mailbox is None or mailbox[1] == 1 + n_storm
+
+        # The worker drains the mailbox and publishes the freshest completed generation.
+        _wait_until(lambda: not runtime._slow_busy)  # noqa: SLF001
+        with runtime._slow_lock:  # noqa: SLF001
+            pending = runtime._pending_prefix  # noqa: SLF001
+        assert pending is not None, "no generation was ever published under the storm"
+        assert pending.source_tick == 1 + n_storm, "published prefix did not converge to the last request"
+
+        # Install it: the next fast tick must converge to the last submitted source tick
+        # (proves the prefix was not starved).
+        runtime.tick(_obs_for(0.25, 2 + n_storm))
+        assert runtime._prefix_source_tick == 1 + n_storm  # noqa: SLF001
+
+        # The fast channel never blocks on the slow worker (no deadlock) and the telemetry
+        # prefix source tick is monotone non-decreasing throughout.
+        prev = runtime._prefix_source_tick  # noqa: SLF001
+        for i in range(3 + n_storm, 3 + n_storm + 5):
+            runtime.tick(_obs_for(0.25, i))
+            assert runtime._prefix_source_tick >= prev  # noqa: SLF001
+            prev = runtime._prefix_source_tick  # noqa: SLF001
+        source_ticks = [t["prefix_source_tick"] for t in runtime.telemetry]
+        assert source_ticks == sorted(source_ticks)
+        assert source_ticks[-1] == 1 + n_storm
+        for entry in runtime.telemetry:
+            assert 0 <= entry["delay_ticks"] <= runtime.flow_config.vlm_delay_max
     finally:
         runtime.close()

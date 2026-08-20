@@ -8,6 +8,7 @@ import threading
 import time
 from typing import Any
 
+import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -17,6 +18,23 @@ from openpi.models import pi0 as _pi0
 from openpi.training.sea_raft import SeaRaftFlowExtractor
 from openpi.transforms import compute_image_frame_offsets
 from openpi.transforms import normalize_flow
+
+
+def _resolve_jax_device(spec: str | None) -> jax.Device | None:
+    """Parse a device spec (``None``, ``"cpu"``, ``"cuda:0"``, ``"gpu:1"``) into a jax device."""
+    if spec is None:
+        return None
+    backend = spec
+    index = 0
+    if ":" in spec:
+        backend, index_str = spec.split(":", 1)
+        index = int(index_str)
+    if backend in ("cuda", "gpu"):
+        backend = "gpu"
+    devices = jax.devices(backend)
+    if not 0 <= index < len(devices):
+        raise ValueError(f"jax_device {spec!r}: backend {backend!r} has {len(devices)} devices")
+    return devices[index]
 
 
 @dataclasses.dataclass
@@ -117,6 +135,13 @@ class FlowPiRuntime:
 
     The slow delay is `current_tick - prefix_source_tick`: the tick of the observation the
     active prefix was computed from, so it includes the VLM compute latency.
+
+    Slow-channel scheduling: one in-flight VLM prefill plus a single latest-pending mailbox.
+    Refresh requests arriving while the worker is busy coalesce into the mailbox (the queue is
+    bounded to one slot), and a completed prefill that is fresher than the active prefix is
+    always published. Under a refresh storm the prefix source tick therefore advances
+    monotonically instead of starving (the old "only the latest submitted generation may
+    publish" scheme could drop every completed prefill and leave the prefix frozen).
     """
 
     def __init__(
@@ -126,12 +151,27 @@ class FlowPiRuntime:
         flow_config: Any,  # pi0_config.FlowConfig
         sea_raft_ckpt: str | None = None,
         sea_raft_device: str = "cuda",
+        jax_device: str | None = None,
         d: int = 1,
         allow_random_init: bool = False,
     ):
         self.model = model
         self.flow_config = flow_config
         self._d = d
+
+        # Optional device placement for the JAX model (slow VLM + fast action expert run on the
+        # same JAX graph and share one parameter tree, so they move together; a true VLM/AE
+        # split across two devices needs process-level separation). SEA-RAFT is pinned
+        # independently via ``sea_raft_device`` (torch), so the flow channel can already be
+        # isolated on its own GPU.
+        self._jax_device = _resolve_jax_device(jax_device)
+        if self._jax_device is not None:
+            graphdef, state = nnx.split(model)
+            state = jax.tree.map(
+                lambda x: jax.device_put(x, self._jax_device) if isinstance(x, jax.Array) else x,
+                state,
+            )
+            self.model = nnx.merge(graphdef, state)
 
         self._cam_keys = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
 
@@ -154,13 +194,19 @@ class FlowPiRuntime:
         # installed into the active StreamingState at the start of the next fast tick.
         self._pending_prefix: PrefixGeneration | None = None
         self._slow_lock = threading.Lock()
-        # Single slow worker: VLM prefills run serially, so a newer refresh always supersedes an
-        # older one (only the latest generation is ever published).
+        # Single slow worker. Scheduling is "one in-flight prefill + one latest-pending
+        # mailbox": when the refresh rate exceeds the VLM service rate, requests coalesce into
+        # a single slot instead of queuing, and a completed prefill that is fresher than the
+        # active prefix is always published (never dropped just because a newer request
+        # arrived while it was computing). This prevents refresh starvation: the active prefix
+        # source tick advances monotonically and the pending queue stays bounded.
         self._slow_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="flowpi-slow")
         self._slow_futures: list[Future] = []
-        # Generation of the most recently submitted refresh; in-flight jobs whose generation is
-        # no longer the latest drop their result.
-        self._slow_latest_gen = 0
+        # True while a prefill is running on the worker (only then may the mailbox accept
+        # requests). Cleared by the worker itself, so a finished worker is never double-booked.
+        self._slow_busy = False
+        # Latest pending refresh observation, coalesced while the worker is busy.
+        self._slow_mailbox: tuple[int, int, _model.Observation] | None = None
 
         # Per-episode streaming state. `StreamingState.prefix_source_tick` (mirrored by
         # `self._prefix_source_tick`) is the single authoritative clock for the age of the
@@ -185,7 +231,15 @@ class FlowPiRuntime:
             "prefill_ms": [],
             "tick_total_ms": [],
             "prefix_age_at_install": [],
+            "prefix_age_ms_at_install": [],
         }
+        # Per-tick freshness telemetry: reconstructs Age_VLM (current - prefix_source_tick),
+        # Age_Flow (always 0: flow is recomputed per tick) and the raw tick numbers from the
+        # wall-clock timing recorded separately by the caller.
+        self.telemetry: list[dict[str, float]] = []
+        # Wall-clock of each frame's ingestion (indexed by episode-relative frame index), used to
+        # report the prefix age in milliseconds; pruned so it stays bounded.
+        self._ingest_wall: dict[int, float] = {}
         # Published-but-never-installed prefix generations (stale episode or out-of-order tick).
         self.num_generation_drops: int = 0
 
@@ -288,12 +342,20 @@ class FlowPiRuntime:
         return kv_cache, prefix_mask
 
     def _publish(self, *, episode_id: int, source_tick: int, kv_cache: Any, prefix_mask: jax.Array) -> None:
-        """Atomically publish a completed prefill; cross-episode results are dropped."""
+        """Atomically publish a completed prefill.
+
+        Cross-episode results are dropped. A completed generation that is *older* than the
+        currently pending one never replaces it: the pending slot is monotonically fresh, so a
+        slow worker finishing behind a newer synchronous refresh cannot regress the prefix.
+        """
         with self._slow_lock:
-            if episode_id == self._episode_id:
-                self._pending_prefix = PrefixGeneration(episode_id, source_tick, kv_cache, prefix_mask)
-            else:
+            if episode_id != self._episode_id:
                 self.num_generation_drops += 1
+                return
+            pending = self._pending_prefix
+            if pending is not None and pending.source_tick > source_tick:
+                return
+            self._pending_prefix = PrefixGeneration(episode_id, source_tick, kv_cache, prefix_mask)
 
     def warm_start(self, observation: _model.Observation) -> None:
         """Begin a new episode: initialise ring buffer, run warm_start.
@@ -309,6 +371,7 @@ class FlowPiRuntime:
         self._prefix_source_tick = 0
         self._episode_id += 1
         self._ingest_frame(observation)
+        self._ingest_wall = {0: time.monotonic()}
 
         self._streaming_state = self.model.warm_start(
             jax.random.key(0),
@@ -318,9 +381,11 @@ class FlowPiRuntime:
         )
         self._tick = 0
         # A new episode starts from a clean slow channel: drop any pending refresh of the
-        # previous episode (in-flight worker results are dropped by the episode-id check).
+        # previous episode (in-flight worker results are dropped by the episode-id check, and
+        # the mailbox is cleared so the worker does not waste a prefill on a stale observation).
         with self._slow_lock:
             self._pending_prefix = None
+            self._slow_mailbox = None
 
     def tick(self, observation: _model.Observation) -> np.ndarray:
         """One fast control tick (50 Hz): fresh state + online flow + one NFE.
@@ -359,6 +424,7 @@ class FlowPiRuntime:
 
         self._frame_index += 1
         self._ingest_frame(observation)
+        self._ingest_wall[self._frame_index] = time.monotonic()
         flow_data, flow_masks = self._compute_flow()
 
         # Attach fresh flow, per-lag validity, and the slow-channel delay: the age of the exact
@@ -368,12 +434,33 @@ class FlowPiRuntime:
         delay = min(delay, self.flow_config.vlm_delay_max)
         if installed:
             self.stats["prefix_age_at_install"].append(delay)
+            wall = self._ingest_wall.get(pending.source_tick)
+            if wall is not None:
+                self.stats["prefix_age_ms_at_install"].append((time.monotonic() - wall) * 1000)
         obs_with_flow = dataclasses.replace(
             observation,
             flow={cam: jnp.asarray(arr)[None, ...] for cam, arr in flow_data.items()},
             flow_masks={cam: jnp.asarray(mask)[None, ...] for cam, mask in flow_masks.items()},
             vlm_delay=jnp.full((observation.state.shape[0],), delay, dtype=jnp.int32),
         )
+
+        # Per-tick freshness telemetry: reconstructs Age_VLM (current - prefix_source_tick),
+        # Age_Flow (always 0 here: flow is recomputed per tick) and the raw tick numbers.
+        self.telemetry.append(
+            {
+                "tick": self._frame_index,
+                "flow_source_tick": self._frame_index,
+                "prefix_source_tick": self._prefix_source_tick or 0,
+                "delay_ticks": delay,
+            }
+        )
+        # Prune the ingestion wall-clock history: only the delay window (plus a generous margin
+        # for a slow VLM) is ever needed to report the prefix age in milliseconds.
+        prune_before = self._frame_index - (self.flow_config.vlm_delay_max + 1024)
+        if prune_before > 0 and len(self._ingest_wall) > self.flow_config.vlm_delay_max + 1024:
+            for k in list(self._ingest_wall):
+                if k < prune_before:
+                    del self._ingest_wall[k]
 
         # One NFE (per-tick RNG: must not repeat after a prefix refresh resets the age).
         rng = jax.random.fold_in(jax.random.key(0), self._tick)
@@ -391,6 +478,13 @@ class FlowPiRuntime:
         counting from the observation this prefix was computed from). With ``wait=True`` the
         prefill runs synchronously in the calling thread and supersedes any in-flight refresh.
 
+        When the refresh rate exceeds the VLM service rate, requests coalesce into a single
+        latest-pending mailbox slot instead of queuing: the worker finishes its current prefill,
+        publishes it, and immediately picks up the latest pending observation (back-to-back,
+        as fast as inference allows). A completed prefill that is fresher than the active prefix
+        is always published, so the prefix source tick advances monotonically even under a
+        refresh storm.
+
         The observation is assumed to be the most recently ingested frame (its episode-relative
         index becomes the new prefix source tick). Worker exceptions are re-raised in the main
         thread at the next tick/refresh/close.
@@ -398,30 +492,46 @@ class FlowPiRuntime:
         self._check_slow_errors()
         episode_id = self._episode_id
         source_tick = self._frame_index
-        # Invalidate any in-flight refresh: only the most recent generation may publish.
-        self._slow_latest_gen += 1
         if wait:
             kv_cache, prefix_mask = self._prefill(observation)
             self._publish(episode_id=episode_id, source_tick=source_tick, kv_cache=kv_cache, prefix_mask=prefix_mask)
-        else:
-            gen = self._slow_latest_gen
-            future = self._slow_executor.submit(self._slow_run, gen, episode_id, source_tick, observation)
-            self._slow_futures.append(future)
+            return
+        with self._slow_lock:
+            if self._slow_busy:
+                # A prefill is already running: coalesce into the single latest-pending slot
+                # (supersedes any older pending observation).
+                self._slow_mailbox = (episode_id, source_tick, observation)
+            else:
+                self._slow_busy = True
+                future = self._slow_executor.submit(self._slow_run, episode_id, source_tick, observation)
+                self._slow_futures.append(future)
 
     def _slow_run(
         self,
-        gen: int,
         episode_id: int,
         source_tick: int,
         observation: _model.Observation,
     ) -> None:
-        """Worker: prefill + publish (only if still the latest generation and same episode)."""
-        kv_cache, prefix_mask = self._prefill(observation)
-        with self._slow_lock:
-            if gen == self._slow_latest_gen and episode_id == self._episode_id:
-                self._pending_prefix = PrefixGeneration(episode_id, source_tick, kv_cache, prefix_mask)
-            else:
-                self.num_generation_drops += 1
+        """Slow worker loop: prefill -> publish -> immediately consume the latest pending
+        observation and repeat.
+
+        Back-to-back scheduling: the VLM is never idle while a refresh is pending, at most one
+        prefill runs at a time, and the refresh queue is bounded to a single mailbox slot
+        (no queued-but-doomed jobs). A completed prefill is published whenever it belongs to the
+        current episode and is no older than the pending generation; the per-tick install check
+        drops anything older than the already-active prefix.
+        """
+        while True:
+            kv_cache, prefix_mask = self._prefill(observation)
+            self._publish(episode_id=episode_id, source_tick=source_tick, kv_cache=kv_cache, prefix_mask=prefix_mask)
+            with self._slow_lock:
+                mailbox = self._slow_mailbox
+                self._slow_mailbox = None
+                if mailbox is not None:
+                    episode_id, source_tick, observation = mailbox
+                    continue
+                self._slow_busy = False
+                return
 
     def close(self) -> None:
         """Drain the slow worker and re-raise its first exception, if any. Idempotent."""

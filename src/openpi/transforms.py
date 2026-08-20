@@ -532,16 +532,20 @@ class DelaySlowImage(DataTransformFn):
     still stacked `[T, 3, H, W]` in `frame_offsets` order. When images are already single frames
     (no history loaded), sets `data["vlm_delay"] = 0` and does nothing else.
 
-    The delay is drawn from a per-instance RNG stream (not a per-sample hash): like the online
-    runtime, each sample and each epoch sees a fresh delay, and the sampled delay never exceeds the
-    frame index (a runtime refresh can never reach further back than the episode start).
+    The delay is drawn from a per-sample RNG stream derived from ``(seed, data-loader worker id,
+    call counter)``, not a fixed per-instance stream: torch DataLoader workers fork the transform,
+    so a single shared stream would sample the *same* delays in every worker (cross-worker
+    correlation). Deriving the stream from the worker id makes the workers independent, and the
+    per-call counter keeps consecutive samples within one worker varied — like the online
+    runtime. The sampled delay never exceeds the frame index (a runtime refresh can never reach
+    further back than the episode start).
     """
 
     def __init__(self, vlm_delay_max: int, frame_offsets: tuple[int, ...], *, seed: int = 0):
         self.vlm_delay_max = vlm_delay_max
         self.frame_offsets = tuple(frame_offsets)
         self.seed = seed
-        self._rng = np.random.default_rng(seed)
+        self._calls = 0
 
     def __call__(self, data: DataDict) -> DataDict:
         images = data.get("images", {})
@@ -552,7 +556,17 @@ class DelaySlowImage(DataTransformFn):
 
         frame_index = int(np.asarray(data["frame_index"]).item())
         max_d = min(self.vlm_delay_max, max(frame_index, 0))
-        d_vlm = int(self._rng.integers(0, max_d + 1))
+        worker_id = 0
+        try:
+            import torch
+
+            worker_info = torch.utils.data.get_worker_info()
+            worker_id = worker_info.id if worker_info is not None else 0
+        except ImportError:
+            pass
+        rng = np.random.default_rng(np.random.SeedSequence([self.seed, worker_id, self._calls]))
+        self._calls += 1
+        d_vlm = int(rng.integers(0, max_d + 1))
 
         idx = frame_offset_index(self.frame_offsets, -d_vlm) if d_vlm > 0 else frame_offset_index(self.frame_offsets, 0)
         data["images"] = {cam: np.asarray(stack)[idx] for cam, stack in images.items()}

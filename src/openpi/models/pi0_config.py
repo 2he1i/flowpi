@@ -136,6 +136,9 @@ class Pi0Config(_model.BaseModelConfig):
     # flowpi: flow fast-path / πR² streaming / slow-channel delay configuration.
     # None (default) keeps the model graph identical to the baseline π0.5.
     flow: FlowConfig | None = None
+    # Baseline image geometry augmentation. FlowConfig.image_geometric_aug overrides this when
+    # FlowPI is enabled because cached flow is computed in the raw image coordinate system.
+    image_geometric_aug: bool = True
 
     # Freeze the SigLIP vision tower. Upstream default (False) trains everything; the flowpi
     # configs opt in explicitly so the frozen-vision policy stays an experiment decision and

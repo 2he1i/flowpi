@@ -63,7 +63,8 @@ def _process_episode(task: dict) -> dict:
 
     extractor = SeaRaftFlowExtractor(
         ckpt_path=task["sea_raft_ckpt"] or None,
-        variant="M",
+        variant=task.get("sea_raft_variant", "M"),
+        iters=task.get("sea_raft_iters"),
         device=task["sea_raft_device"],
         allow_random_init=task.get("sea_raft_allow_random_init", False),
     )
@@ -193,6 +194,8 @@ def main():
             "max_frames": extra.max_frames,
             "flow_cache_dir": str(cache_dir),
             "sea_raft_ckpt": flow_cfg.sea_raft_ckpt,
+            "sea_raft_variant": flow_cfg.sea_raft_variant,
+            "sea_raft_iters": flow_cfg.sea_raft_iters,
             "sea_raft_device": flow_cfg.sea_raft_device,
             "sea_raft_allow_random_init": flow_cfg.sea_raft_allow_random_init,
             "batch_size": 16,
@@ -207,6 +210,8 @@ def main():
         with ProcessPoolExecutor(max_workers=extra.num_workers) as pool:
             results = list(pool.map(_process_episode, tasks))
 
+    from openpi.training.sea_raft import checkpoint_sha256
+
     meta = {
         "num_flow_steps": model_flow.num_flow_steps,
         "flow_stride_frames": model_flow.flow_stride_frames,
@@ -214,7 +219,10 @@ def main():
         "image_size": results[0]["image_size"],
         "fps": info["fps"],
         "sea_raft_ckpt": flow_cfg.sea_raft_ckpt,
-        "sea_raft_variant": "M",
+        "sea_raft_checkpoint_sha256": checkpoint_sha256(flow_cfg.sea_raft_ckpt),
+        "sea_raft_variant": flow_cfg.sea_raft_variant,
+        "sea_raft_iters": flow_cfg.sea_raft_iters,
+        "camera_keys": sorted(_cache_name(cam) for cam in cam_keys),
         "episodes": {str(r["episode"]): r["num_pairs"] for r in results},
     }
     with open(cache_dir / "meta.json", "w") as f:

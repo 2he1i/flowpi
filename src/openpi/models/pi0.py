@@ -328,7 +328,9 @@ class Pi0(_model.BaseModel):
         are computed from the param tree by the training loop (they do not need a forward pass).
         """
         preprocess_rng, noise_rng, time_rng, mix_rng = jax.random.split(rng, 4)
-        geometric_aug = True if self.flow_config is None else self.flow_config.image_geometric_aug
+        geometric_aug = (
+            self.config.image_geometric_aug if self.flow_config is None else self.flow_config.image_geometric_aug
+        )
         observation = _model.preprocess_observation(
             preprocess_rng, observation, train=train, geometric_aug=geometric_aug
         )

@@ -150,6 +150,8 @@ class FlowPiRuntime:
         *,
         flow_config: Any,  # pi0_config.FlowConfig
         sea_raft_ckpt: str | None = None,
+        sea_raft_variant: str = "M",
+        sea_raft_iters: int | None = None,
         sea_raft_device: str = "cuda",
         jax_device: str | None = None,
         d: int = 1,
@@ -184,7 +186,8 @@ class FlowPiRuntime:
         # SEA-RAFT extractor (online flow).
         self._raft = SeaRaftFlowExtractor(
             ckpt_path=sea_raft_ckpt,
-            variant="M",
+            variant=sea_raft_variant,
+            iters=sea_raft_iters,
             device=sea_raft_device,
             allow_random_init=allow_random_init,
         )
@@ -230,7 +233,12 @@ class FlowPiRuntime:
             "flow_ms": [],
             "prefill_ms": [],
             "tick_total_ms": [],
+            "tick_wall_ms": [],
+            # Keep the original key clamped for consumers that already use it; the explicit raw
+            # series is what delay fitting should use.
             "prefix_age_at_install": [],
+            "prefix_age_at_install_raw": [],
+            "prefix_age_at_install_clamped": [],
             "prefix_age_ms_at_install": [],
         }
         # Per-tick freshness telemetry: reconstructs Age_VLM (current - prefix_source_tick),
@@ -435,9 +443,12 @@ class FlowPiRuntime:
         # prefix stored in the streaming state, `current_tick - prefix_source_tick` (clamped so
         # the embedding lookup stays in range).
         delay = max(0, self._frame_index - (self._prefix_source_tick or 0))
+        delay_raw = delay
         delay = min(delay, self.flow_config.vlm_delay_max)
         if installed:
             self.stats["prefix_age_at_install"].append(delay)
+            self.stats["prefix_age_at_install_raw"].append(delay_raw)
+            self.stats["prefix_age_at_install_clamped"].append(delay)
             wall = self._ingest_wall.get(pending.source_tick)
             if wall is not None:
                 self.stats["prefix_age_ms_at_install"].append((time.monotonic() - wall) * 1000)
@@ -456,6 +467,8 @@ class FlowPiRuntime:
                 "flow_source_tick": self._frame_index,
                 "prefix_source_tick": self._prefix_source_tick or 0,
                 "delay_ticks": delay,
+                "delay_ticks_raw": delay_raw,
+                "delay_ticks_clamped": delay,
             }
         )
         # Prune the ingestion wall-clock history: only the delay window (plus a generous margin

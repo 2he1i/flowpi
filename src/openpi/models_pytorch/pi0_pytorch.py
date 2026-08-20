@@ -162,7 +162,9 @@ class PI0Pytorch(nn.Module):
 
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
-        geometric_aug = True if self.flow_config is None else self.flow_config.image_geometric_aug
+        geometric_aug = (
+            self.config.image_geometric_aug if self.flow_config is None else self.flow_config.image_geometric_aug
+        )
         observation = _preprocessing.preprocess_observation_pytorch(
             observation, train=train, geometric_aug=geometric_aug
         )

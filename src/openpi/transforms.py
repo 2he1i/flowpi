@@ -393,6 +393,9 @@ class LoadFlowCache(DataTransformFn):
         flow_image_size: tuple[int, int],
         flow_scale: float,
         flow_clamp: float,
+        sea_raft_ckpt: str | pathlib.Path | None = None,
+        sea_raft_variant: str | None = None,
+        sea_raft_iters: int | None = None,
         max_cached_episodes: int = 8,
     ):
         self.flow_cache_dir = pathlib.Path(flow_cache_dir)
@@ -402,6 +405,9 @@ class LoadFlowCache(DataTransformFn):
         self.flow_image_size = tuple(flow_image_size)
         self.flow_scale = flow_scale
         self.flow_clamp = flow_clamp
+        self.sea_raft_ckpt = str(sea_raft_ckpt) if sea_raft_ckpt else None
+        self.sea_raft_variant = sea_raft_variant
+        self.sea_raft_iters = sea_raft_iters
         self._max_cached = max(1, max_cached_episodes)
         self._validate_meta()
         # OrderedDict doubles as the LRU: hits move the key to the end, eviction drops the front.
@@ -428,6 +434,36 @@ class LoadFlowCache(DataTransformFn):
                     f"Flow cache mismatch for '{key}': cache has {meta[key]}, config expects {value}. "
                     "Recompute the flow cache or update the config."
                 )
+
+        provenance_keys = (
+            "sea_raft_variant",
+            "sea_raft_iters",
+            "sea_raft_checkpoint_sha256",
+            "camera_keys",
+        )
+        strict_provenance = self.sea_raft_ckpt is not None
+        if strict_provenance or any(key in meta for key in provenance_keys):
+            from openpi.training.sea_raft import checkpoint_sha256
+
+            expected_provenance = {
+                "sea_raft_variant": self.sea_raft_variant,
+                "sea_raft_iters": self.sea_raft_iters,
+                "sea_raft_checkpoint_sha256": checkpoint_sha256(self.sea_raft_ckpt),
+                "camera_keys": sorted(self.cam_keys),
+            }
+            for key, value in expected_provenance.items():
+                if value is None:
+                    continue
+                if key not in meta:
+                    if strict_provenance:
+                        raise ValueError(f"Flow cache is missing provenance field '{key}'. Recompute the flow cache.")
+                    continue
+                actual = sorted(meta[key]) if key == "camera_keys" else meta[key]
+                if actual != value:
+                    raise ValueError(
+                        f"Flow cache mismatch for '{key}': cache has {actual}, config expects {value}. "
+                        "Recompute the flow cache or update the config."
+                    )
 
     def _episode(self, episode_index: int) -> tuple[dict[str, np.ndarray], np.ndarray]:
         cached = self._mmaps.get(episode_index)

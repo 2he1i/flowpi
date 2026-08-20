@@ -32,17 +32,20 @@ _SMOOTHING_ALPHA = 0.8  # P̂ weight; uniform floor is (1 - alpha)
 
 
 def _load_delays(path: Path) -> tuple[np.ndarray, int]:
-    """Reads the observed delay ticks (falling back to the install-age stats when the per-tick
-    telemetry is missing) plus the vlm_delay_max recorded by the replay."""
+    """Reads raw delay ticks, falling back to legacy clamped telemetry when necessary."""
     with open(path) as f:
         payload = json.load(f)
     vlm_delay_max = int(payload.get("vlm_delay_max", 0))
     telemetry = payload.get("telemetry") or []
-    if telemetry and "delay_ticks" in telemetry[0]:
+    if telemetry and "delay_ticks_raw" in telemetry[0]:
+        delays = np.asarray([t["delay_ticks_raw"] for t in telemetry], dtype=np.int64)
+    elif telemetry and "delay_ticks" in telemetry[0]:
         delays = np.asarray([t["delay_ticks"] for t in telemetry], dtype=np.int64)
     else:
         stats = payload.get("stats") or {}
-        delays = np.asarray(stats.get("prefix_age_at_install", []), dtype=np.int64)
+        delays = np.asarray(
+            stats.get("prefix_age_at_install_raw", stats.get("prefix_age_at_install", [])), dtype=np.int64
+        )
     if delays.size == 0:
         raise ValueError(f"No delay samples in {path}. Run a realtime replay with --telemetry-json first.")
     return delays, vlm_delay_max

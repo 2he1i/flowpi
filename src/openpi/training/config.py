@@ -80,6 +80,8 @@ class FlowDataConfig:
     mode: Literal["cache", "online"] = "cache"
     flow_cache_dir: str | None = None
     sea_raft_ckpt: str | None = None
+    sea_raft_variant: Literal["S", "M", "L"] = "M"
+    sea_raft_iters: int | None = None
     sea_raft_device: str = "cpu"
     # Opt-in for random SEA-RAFT weights (tests/smoke runs only); production must pass a checkpoint.
     sea_raft_allow_random_init: bool = False
@@ -87,6 +89,11 @@ class FlowDataConfig:
     load_flow_cache: bool = True
     # Include the DelaySlowImage transform (stale VLM image simulation).
     sample_vlm_delay: bool = True
+
+    def __post_init__(self) -> None:
+        from openpi.training.sea_raft import resolve_sea_raft_iters
+
+        object.__setattr__(self, "sea_raft_iters", resolve_sea_raft_iters(self.sea_raft_variant, self.sea_raft_iters))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -320,7 +327,8 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
 
                     extractor = SeaRaftFlowExtractor(
                         ckpt_path=self.flow.sea_raft_ckpt or None,
-                        variant="M",
+                        variant=self.flow.sea_raft_variant,
+                        iters=self.flow.sea_raft_iters,
                         device=self.flow.sea_raft_device,
                         allow_random_init=self.flow.sea_raft_allow_random_init,
                     )
@@ -347,6 +355,9 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
                             flow_image_size=model_flow.flow_image_size,
                             flow_scale=model_flow.flow_scale,
                             flow_clamp=model_flow.flow_clamp,
+                            sea_raft_ckpt=self.flow.sea_raft_ckpt,
+                            sea_raft_variant=self.flow.sea_raft_variant,
+                            sea_raft_iters=self.flow.sea_raft_iters,
                         )
                     )
             if self.flow.sample_vlm_delay:
@@ -695,6 +706,7 @@ def _flowpi_ablation_configs() -> tuple[TrainConfig, ...]:
             discrete_state_input=discrete_state_input,
             flow=flow,
             freeze_vision_encoder=True,
+            image_geometric_aug=False,
         )
         data_flow = (
             FlowDataConfig(

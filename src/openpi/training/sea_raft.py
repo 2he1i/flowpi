@@ -7,6 +7,7 @@ this extractor is only used for cache precomputation, inference, and tests.
 """
 
 import functools
+import hashlib
 import pathlib
 import sys
 
@@ -21,6 +22,28 @@ _VARIANT_CONFIGS = {
     "M": (128, 4, 4, [64, 128, 256]),
     "L": (192, 6, 4, [64, 160, 224]),
 }
+
+
+def resolve_sea_raft_iters(variant: str, iters: int | None = None) -> int:
+    """Return the effective refinement iteration count for a SEA-RAFT variant."""
+    if variant not in _VARIANT_CONFIGS:
+        raise ValueError(f"Unknown SEA-RAFT variant: {variant}. Choose from {list(_VARIANT_CONFIGS)}")
+    if iters is None:
+        return _VARIANT_CONFIGS[variant][1]
+    if iters <= 0:
+        raise ValueError(f"SEA-RAFT iters must be positive, got {iters}")
+    return iters
+
+
+def checkpoint_sha256(path: str | pathlib.Path | None) -> str | None:
+    """Return a checkpoint's SHA256 digest, or None when random initialization is used."""
+    if not path:
+        return None
+    digest = hashlib.sha256()
+    with open(path, "rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _make_raft_args(dim: int, iters: int, radius: int, block_dims: list[int]):
@@ -76,13 +99,11 @@ class SeaRaftFlowExtractor:
         *,
         allow_random_init: bool = False,
     ):
-        if variant not in _VARIANT_CONFIGS:
-            raise ValueError(f"Unknown SEA-RAFT variant: {variant}. Choose from {list(_VARIANT_CONFIGS)}")
-
-        dim, default_iters, radius, block_dims = _VARIANT_CONFIGS[variant]
+        effective_iters = resolve_sea_raft_iters(variant, iters)
+        dim, _, radius, block_dims = _VARIANT_CONFIGS[variant]
         args = _make_raft_args(
             dim=dim,
-            iters=iters if iters is not None else default_iters,
+            iters=effective_iters,
             radius=radius,
             block_dims=block_dims,
         )

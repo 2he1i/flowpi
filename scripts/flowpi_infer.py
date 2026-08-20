@@ -131,6 +131,8 @@ def main():
         model,
         flow_config=flow_cfg,
         sea_raft_ckpt=data_config.flow.sea_raft_ckpt if data_config.flow else None,
+        sea_raft_variant=data_config.flow.sea_raft_variant if data_config.flow else "M",
+        sea_raft_iters=data_config.flow.sea_raft_iters if data_config.flow else None,
         sea_raft_device=sea_raft_device,
         jax_device=args.jax_device,
         d=1,
@@ -206,7 +208,9 @@ def main():
     if runtime.telemetry:
         ticks = np.array([t["tick"] for t in runtime.telemetry])
         prefix_src = np.array([t["prefix_source_tick"] for t in runtime.telemetry])
-        delays = np.array([t["delay_ticks"] for t in runtime.telemetry])
+        delays = np.array(
+            [t["delay_ticks_raw"] if "delay_ticks_raw" in t else t["delay_ticks"] for t in runtime.telemetry]
+        )
         print(
             f"freshness: ticks={len(ticks)}, "
             f"prefix_source_tick last={prefix_src[-1]} (of tick {ticks[-1]}), "

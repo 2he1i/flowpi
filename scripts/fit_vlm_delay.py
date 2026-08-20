@@ -70,9 +70,10 @@ def main():
     delay_max = args.delay_max if args.delay_max is not None else max(p99, 1)
     n = delay_max + 1
 
-    hist = np.bincount(delays.astype(np.int64), minlength=n)[:n].astype(np.float64)
+    clipped_delays = np.minimum(delays, delay_max)
+    hist = np.bincount(clipped_delays.astype(np.int64), minlength=n)[:n].astype(np.float64)
     if hist.sum() == 0:
-        raise ValueError(f"All observed delays are beyond vlm_delay_max={delay_max}; raise --delay-max.")
+        raise ValueError(f"No valid delay samples for vlm_delay_max={delay_max}.")
     fitted = hist / hist.sum()
     uniform = np.full(n, 1.0 / n)
     smoothed = args.alpha * fitted + (1.0 - args.alpha) * uniform

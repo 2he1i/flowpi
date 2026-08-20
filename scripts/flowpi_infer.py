@@ -197,7 +197,7 @@ def main():
         # Launch the next slow refresh before pacing the tick. Its worker can now overlap the
         # remaining control-period sleep instead of starting one full tick late.
         if frame_idx % args.slow_every_n == 0:
-            runtime.refresh_prefix(obs)
+            runtime.refresh_prefix()
 
         if args.realtime:
             elapsed = time.perf_counter() - loop_t0

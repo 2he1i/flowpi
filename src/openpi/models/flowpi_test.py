@@ -583,6 +583,7 @@ def test_flow_config_validation():
         {"flow_clamp": 0.0},
         {"tokenizer_channels": ()},
         {"tokenizer_channels": (32, 0)},
+        {"tokenizer_channels": (32, 64, 30)},
         {"tokenizer_mlp_hidden": 0},
         {"p_standard": 1.5},
         {"p_standard": -0.1},

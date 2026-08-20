@@ -1,0 +1,36 @@
+diff --git a/core/raft.py b/core/raft.py
+index 4c8d92f..0d37681 100644
+--- a/core/raft.py
++++ b/core/raft.py
+@@ -76 +76 @@ class RAFT(
+-    def forward(self, image1, image2, iters=None, flow_gt=None, test_mode=False):
++    def forward(self, image1, image2, iters=None, flow_gt=None, test_mode=False, return_low_res=False):
+@@ -134,0 +135,11 @@ class RAFT(
++        result = None
++        if return_low_res:
++            # 1/8-resolution flow after the last refinement, before upsampling. Cropped back to the
++            # original (unpadded) resolution using the padder's padding scaled by 1/8.
++            _, _, H_low, W_low = flow_8x.shape
++            c_low = [
++                self._pad_low(padder._pad[2], 8), H_low - self._pad_low(padder._pad[3], 8),
++                self._pad_low(padder._pad[0], 8), W_low - self._pad_low(padder._pad[1], 8),
++            ]
++            flow_8x_unpadded = flow_8x[..., c_low[0]:c_low[1], c_low[2]:c_low[3]]
++
+@@ -159 +170 @@ class RAFT(
+-            return {'final': flow_predictions[-1], 'flow': flow_predictions, 'info': info_predictions, 'nf': nf_predictions}
++            result = {'final': flow_predictions[-1], 'flow': flow_predictions, 'info': info_predictions, 'nf': nf_predictions}
+@@ -161 +172,10 @@ class RAFT(
+-            return {'final': flow_predictions[-1], 'flow': flow_predictions, 'info': info_predictions, 'nf': None}
+\ No newline at end of file
++            result = {'final': flow_predictions[-1], 'flow': flow_predictions, 'info': info_predictions, 'nf': None}
++
++        if return_low_res:
++            result['flow_8x'] = flow_8x_unpadded
++        return result
++
++    @staticmethod
++    def _pad_low(pad, factor=8):
++        """Scale a full-resolution padding amount down to the 1/8-resolution grid."""
++        return pad // factor
+\ No newline at end of file

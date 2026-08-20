@@ -463,7 +463,8 @@ class Pi0(_model.BaseModel):
             ("mid", (1.0 / 3.0, 2.0 / 3.0)),
             ("high", (2.0 / 3.0, 1.0)),
         ):
-            mask = ((tau >= lo) & (tau < hi)).astype(jnp.float32) * loss_mask
+            upper = tau <= hi if name == "high" else tau < hi
+            mask = ((tau >= lo) & upper).astype(jnp.float32) * loss_mask
             metrics[f"loss_tau_{name}"] = masked_mean(per_pos, mask)
 
         if flow_stats is not None:

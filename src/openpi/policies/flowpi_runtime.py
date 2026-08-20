@@ -55,6 +55,15 @@ class PrefixGeneration:
     prefix_mask: jax.Array
 
 
+@dataclasses.dataclass(frozen=True)
+class _ObservationSnapshot:
+    """A runtime-owned observation and the exact episode tick it belongs to."""
+
+    episode_id: int
+    source_tick: int
+    observation: _model.Observation
+
+
 class _FrameRingBuffer:
     """Sliding window of decoded camera frames in CHW uint8 layout.
 
@@ -129,7 +138,7 @@ class FlowPiRuntime:
             obs = dataset[frame_idx]                # (Observation state, images)
             actions = runtime.tick(obs)
             if frame_idx % slow_every_n == 0:
-                runtime.refresh_prefix(obs)         # async: returns immediately
+                runtime.refresh_prefix()              # async: returns immediately
             # use actions ...
         runtime.close()                             # drain the slow worker, propagate errors
 
@@ -208,8 +217,9 @@ class FlowPiRuntime:
         # True while a prefill is running on the worker (only then may the mailbox accept
         # requests). Cleared by the worker itself, so a finished worker is never double-booked.
         self._slow_busy = False
-        # Latest pending refresh observation, coalesced while the worker is busy.
-        self._slow_mailbox: tuple[int, int, _model.Observation] | None = None
+        # Latest pending refresh snapshot, coalesced while the worker is busy. The snapshot keeps
+        # episode id, source tick, and observation inseparable.
+        self._slow_mailbox: _ObservationSnapshot | None = None
 
         # Per-episode streaming state. `StreamingState.prefix_source_tick` (mirrored by
         # `self._prefix_source_tick`) is the single authoritative clock for the age of the
@@ -221,6 +231,9 @@ class FlowPiRuntime:
         self._episode_id = 0
         # Episode-relative index of the most recently ingested frame (0 = the warm-start frame).
         self._frame_index = 0
+        # Runtime-owned latest observation. Prefix refreshes always capture this snapshot instead
+        # of accepting a caller-supplied observation that could belong to another tick.
+        self._latest_observation: _ObservationSnapshot | None = None
         # Episode-relative tick of the observation the active prefix was computed from.
         self._prefix_source_tick: int | None = None
 
@@ -353,7 +366,7 @@ class FlowPiRuntime:
         self.stats["prefill_ms"].append((time.perf_counter() - t0) * 1000)
         return kv_cache, prefix_mask
 
-    def _publish(self, *, episode_id: int, source_tick: int, kv_cache: Any, prefix_mask: jax.Array) -> None:
+    def _publish(self, *, snapshot: _ObservationSnapshot, kv_cache: Any, prefix_mask: jax.Array) -> None:
         """Atomically publish a completed prefill.
 
         Cross-episode results are dropped. A completed generation that is *older* than the
@@ -361,13 +374,13 @@ class FlowPiRuntime:
         slow worker finishing behind a newer synchronous refresh cannot regress the prefix.
         """
         with self._slow_lock:
-            if episode_id != self._episode_id:
+            if snapshot.episode_id != self._episode_id:
                 self.num_generation_drops += 1
                 return
             pending = self._pending_prefix
-            if pending is not None and pending.source_tick > source_tick:
+            if pending is not None and pending.source_tick > snapshot.source_tick:
                 return
-            self._pending_prefix = PrefixGeneration(episode_id, source_tick, kv_cache, prefix_mask)
+            self._pending_prefix = PrefixGeneration(snapshot.episode_id, snapshot.source_tick, kv_cache, prefix_mask)
 
     def warm_start(self, observation: _model.Observation) -> None:
         """Begin a new episode and synchronously install its initial slow prefix.
@@ -383,6 +396,11 @@ class FlowPiRuntime:
         self._frame_index = 0
         self._prefix_source_tick = 0
         self._episode_id += 1
+        snapshot = _ObservationSnapshot(self._episode_id, 0, observation)
+        with self._slow_lock:
+            self._latest_observation = snapshot
+            self._pending_prefix = None
+            self._slow_mailbox = None
         self._ingest_frame(observation)
         self._ingest_wall = {0: time.monotonic()}
 
@@ -393,12 +411,6 @@ class FlowPiRuntime:
             d=self._d,
         )
         self._tick = 0
-        # A new episode starts from a clean slow channel: drop any pending refresh of the
-        # previous episode (in-flight worker results are dropped by the episode-id check, and
-        # the mailbox is cleared so the worker does not waste a prefill on a stale observation).
-        with self._slow_lock:
-            self._pending_prefix = None
-            self._slow_mailbox = None
 
     def tick(self, observation: _model.Observation) -> np.ndarray:
         """One fast control tick (50 Hz): fresh state + online flow + one NFE.
@@ -438,6 +450,8 @@ class FlowPiRuntime:
         self._frame_index += 1
         self._ingest_frame(observation)
         self._ingest_wall[self._frame_index] = time.monotonic()
+        with self._slow_lock:
+            self._latest_observation = _ObservationSnapshot(self._episode_id, self._frame_index, observation)
         flow_data, flow_masks = self._compute_flow()
 
         # Attach fresh flow, per-lag validity, and the slow-channel delay: the age of the exact
@@ -487,7 +501,7 @@ class FlowPiRuntime:
         self._streaming_state = new_state
         return np.asarray(emit[0])  # [d, action_dim]
 
-    def refresh_prefix(self, observation: _model.Observation, *, wait: bool = False) -> None:
+    def refresh_prefix(self, *, wait: bool = False) -> None:
         """Slow-channel: re-run the VLM prefix encoder and produce fresh KV cache.
 
         By default the prefill runs on a single background worker; the result is published
@@ -498,44 +512,42 @@ class FlowPiRuntime:
 
         When the refresh rate exceeds the VLM service rate, requests coalesce into a single
         latest-pending mailbox slot instead of queuing: the worker finishes its current prefill,
-        publishes it, and immediately picks up the latest pending observation (back-to-back,
+        publishes it, and immediately picks up the latest pending snapshot (back-to-back,
         as fast as inference allows). A completed prefill that is fresher than the active prefix
         is always published, so the prefix source tick advances monotonically even under a
         refresh storm.
 
-        The observation is assumed to be the most recently ingested frame (its episode-relative
-        index becomes the new prefix source tick). Worker exceptions are re-raised in the main
-        thread at the next tick/refresh/close.
+        The refresh always uses the latest observation ingested by warm_start or tick. Its episode
+        id and source tick are captured with that observation as one immutable snapshot, so the
+        worker cannot compute a prefix from one tick while labeling it as another. Worker
+        exceptions are re-raised in the main thread at the next tick/refresh/close.
         """
         self._check_slow_errors()
-        episode_id = self._episode_id
-        source_tick = self._frame_index
+        with self._slow_lock:
+            snapshot = self._latest_observation
+        if snapshot is None:
+            raise RuntimeError("call warm_start before refresh_prefix")
         if wait:
             # warm_start and a repeated synchronous refresh for the same frame refer to the
             # already-active prefix. Keep the old call pattern a harmless no-op.
-            if self._streaming_state is not None and source_tick == self._prefix_source_tick:
+            if self._streaming_state is not None and snapshot.source_tick == self._prefix_source_tick:
                 return
-            kv_cache, prefix_mask = self._prefill(observation)
-            self._publish(episode_id=episode_id, source_tick=source_tick, kv_cache=kv_cache, prefix_mask=prefix_mask)
+            kv_cache, prefix_mask = self._prefill(snapshot.observation)
+            self._publish(snapshot=snapshot, kv_cache=kv_cache, prefix_mask=prefix_mask)
             return
         with self._slow_lock:
             if self._slow_busy:
-                # A prefill is already running: coalesce into the single latest-pending slot
-                # (supersedes any older pending observation).
-                self._slow_mailbox = (episode_id, source_tick, observation)
+                # A prefill is already running: coalesce into a single latest-pending slot
+                # (supersedes any older pending snapshot).
+                self._slow_mailbox = snapshot
             else:
                 self._slow_busy = True
-                future = self._slow_executor.submit(self._slow_run, episode_id, source_tick, observation)
+                future = self._slow_executor.submit(self._slow_run, snapshot)
                 self._slow_futures.append(future)
 
-    def _slow_run(
-        self,
-        episode_id: int,
-        source_tick: int,
-        observation: _model.Observation,
-    ) -> None:
+    def _slow_run(self, snapshot: _ObservationSnapshot) -> None:
         """Slow worker loop: prefill -> publish -> immediately consume the latest pending
-        observation and repeat.
+        snapshot and repeat.
 
         Back-to-back scheduling: the VLM is never idle while a refresh is pending, at most one
         prefill runs at a time, and the refresh queue is bounded to a single mailbox slot
@@ -543,17 +555,22 @@ class FlowPiRuntime:
         current episode and is no older than the pending generation; the per-tick install check
         drops anything older than the already-active prefix.
         """
-        while True:
-            kv_cache, prefix_mask = self._prefill(observation)
-            self._publish(episode_id=episode_id, source_tick=source_tick, kv_cache=kv_cache, prefix_mask=prefix_mask)
+        try:
+            while True:
+                kv_cache, prefix_mask = self._prefill(snapshot.observation)
+                self._publish(snapshot=snapshot, kv_cache=kv_cache, prefix_mask=prefix_mask)
+                with self._slow_lock:
+                    mailbox = self._slow_mailbox
+                    self._slow_mailbox = None
+                    if mailbox is not None:
+                        snapshot = mailbox
+                        continue
+                    self._slow_busy = False
+                    return
+        finally:
+            # A worker exception must not leave the bounded mailbox permanently marked busy.
             with self._slow_lock:
-                mailbox = self._slow_mailbox
-                self._slow_mailbox = None
-                if mailbox is not None:
-                    episode_id, source_tick, observation = mailbox
-                    continue
                 self._slow_busy = False
-                return
 
     def close(self) -> None:
         """Drain the slow worker and re-raise its first exception, if any. Idempotent."""

@@ -79,6 +79,11 @@ class FlowConfig:
             raise ValueError("tokenizer_channels must be non-empty")
         if any(c <= 0 for c in self.tokenizer_channels):
             raise ValueError(f"tokenizer_channels must be positive, got {self.tokenizer_channels}")
+        if self.tokenizer_channels[-1] % 4 != 0:
+            raise ValueError(
+                "the final tokenizer channel width must be divisible by 4 for the row/column "
+                f"sin-cos positional embedding, got {self.tokenizer_channels[-1]}"
+            )
         if self.tokenizer_mlp_hidden <= 0:
             raise ValueError(f"tokenizer_mlp_hidden must be positive, got {self.tokenizer_mlp_hidden}")
         if not 0.0 <= self.p_standard <= 1.0:

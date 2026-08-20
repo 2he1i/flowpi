@@ -4,3 +4,6 @@
 [submodule "third_party/libero"]
 	path = third_party/libero
 	url = https://github.com/Lifelong-Robot-Learning/LIBERO.git
+[submodule "SEA-RAFT"]
+	path = SEA-RAFT
+	url = https://github.com/princeton-vl/SEA-RAFT.git

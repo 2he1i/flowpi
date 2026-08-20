@@ -104,7 +104,7 @@ def _run_runtime_test(sea_raft_device="cuda"):
 
     # --- warm_start ---
     runtime.warm_start(observations[0])
-    runtime.refresh_prefix(observations[0], wait=True)
+    runtime.refresh_prefix(wait=True)
     initial_actions = runtime.emit()
     assert initial_actions.shape == (1, 32)
     assert np.all(np.isfinite(initial_actions))
@@ -139,7 +139,7 @@ def _run_runtime_test(sea_raft_device="cuda"):
         # Refresh every 5 ticks: publish a fresh prefix but do NOT touch the active source tick yet.
         if i % 5 == 0:
             kv_before_refresh = jax.tree.leaves(runtime._streaming_state.kv_cache)  # noqa: SLF001
-            runtime.refresh_prefix(observations[i], wait=True)
+            runtime.refresh_prefix(wait=True)
             assert runtime._prefix_source_tick == source_tick  # noqa: SLF001
 
     # Post-refresh age check.
@@ -256,6 +256,35 @@ def _wait_until(condition, timeout_s=30.0) -> None:
     raise TimeoutError("condition not met in time")
 
 
+def test_refresh_prefix_uses_runtime_owned_latest_observation():
+    """Synchronous refresh must prefill the exact observation most recently ingested by tick."""
+    runtime = _make_runtime()
+    observed = []
+    obs0 = _obs_for(0.25, 0)
+    obs1 = _obs_for(0.5, 1)
+
+    def fake_prefill(observation):
+        observed.append(observation)
+        return jnp.zeros((1, 1)), jnp.ones((1, 1), dtype=bool)
+
+    runtime._prefill = fake_prefill  # noqa: SLF001
+    try:
+        runtime.warm_start(obs0)
+        runtime.tick(obs1)
+        runtime.refresh_prefix(wait=True)
+
+        assert len(observed) == 1
+        assert observed[0] is obs1
+        pending = runtime._pending_prefix  # noqa: SLF001
+        assert pending is not None
+        assert pending.episode_id == runtime._episode_id  # noqa: SLF001
+        assert pending.source_tick == 1
+        with pytest.raises(TypeError):
+            runtime.refresh_prefix(obs0)
+    finally:
+        runtime.close()
+
+
 def test_async_refresh_installed_on_next_tick():
     """An async refresh is installed at the next fast tick with the correct source tick."""
     runtime = _make_runtime()
@@ -263,7 +292,7 @@ def test_async_refresh_installed_on_next_tick():
         runtime.warm_start(_obs_for(0.25, 0))
         runtime.tick(_obs_for(0.25, 1))
         # Refresh with the most recently ingested frame (index 1) -> source tick 1.
-        runtime.refresh_prefix(_obs_for(0.25, 1), wait=False)
+        runtime.refresh_prefix(wait=False)
         _wait_until(lambda: runtime._pending_prefix is not None)  # noqa: SLF001
         assert runtime._pending_prefix.source_tick == 1  # noqa: SLF001
         assert runtime._prefix_source_tick == 0  # noqa: SLF001
@@ -284,7 +313,7 @@ def test_stale_prefix_generation_is_dropped():
         for i in range(1, 6):
             runtime.tick(_obs_for(0.25, i))
         # Active prefix comes from frame 5.
-        runtime.refresh_prefix(_obs_for(0.25, 5), wait=True)
+        runtime.refresh_prefix(wait=True)
         runtime.tick(_obs_for(0.25, 6))
         assert runtime._prefix_source_tick == 5  # noqa: SLF001
 
@@ -292,7 +321,15 @@ def test_stale_prefix_generation_is_dropped():
         kv_cache, prefix_mask = runtime.model._prefix_forward(  # noqa: SLF001
             _model.preprocess_observation(None, _obs_for(0.25, 1), train=False)
         )
-        runtime._publish(episode_id=runtime._episode_id, source_tick=1, kv_cache=kv_cache, prefix_mask=prefix_mask)  # noqa: SLF001
+        runtime._publish(  # noqa: SLF001
+            snapshot=flowpi_runtime._ObservationSnapshot(  # noqa: SLF001
+                runtime._episode_id,  # noqa: SLF001
+                1,
+                _obs_for(0.25, 1),
+            ),
+            kv_cache=kv_cache,
+            prefix_mask=prefix_mask,
+        )
         runtime.tick(_obs_for(0.25, 7))
         assert runtime._prefix_source_tick == 5  # noqa: SLF001
         assert runtime.num_generation_drops >= 1
@@ -309,7 +346,15 @@ def test_cross_episode_prefix_is_dropped():
         kv_cache, prefix_mask = runtime.model._prefix_forward(  # noqa: SLF001
             _model.preprocess_observation(None, _obs_for(0.25, 0), train=False)
         )
-        runtime._publish(episode_id=runtime._episode_id - 1, source_tick=0, kv_cache=kv_cache, prefix_mask=prefix_mask)  # noqa: SLF001
+        runtime._publish(  # noqa: SLF001
+            snapshot=flowpi_runtime._ObservationSnapshot(  # noqa: SLF001
+                runtime._episode_id - 1,  # noqa: SLF001
+                0,
+                _obs_for(0.25, 0),
+            ),
+            kv_cache=kv_cache,
+            prefix_mask=prefix_mask,
+        )
         kv_old = jax.tree.leaves(runtime._streaming_state.kv_cache)  # noqa: SLF001
         runtime.tick(_obs_for(0.25, 1))
         assert runtime._prefix_source_tick == 0  # noqa: SLF001
@@ -332,7 +377,7 @@ def test_slow_worker_exception_propagates():
     try:
         runtime.warm_start(_obs_for(0.25, 0))
         runtime.model._prefix_forward = boom  # noqa: SLF001
-        runtime.refresh_prefix(_obs_for(0.25, 1), wait=False)
+        runtime.refresh_prefix(wait=False)
         _wait_until(lambda: runtime._slow_futures and runtime._slow_futures[0].done())  # noqa: SLF001
         with pytest.raises(RuntimeError, match="prefill exploded"):
             runtime.tick(_obs_for(0.25, 2))
@@ -380,13 +425,13 @@ def test_refresh_storm_coalesces_and_never_starves():
         n_storm = 25
         for i in range(2, 2 + n_storm):
             runtime.tick(_obs_for(0.25, i))
-            runtime.refresh_prefix(_obs_for(0.25, i), wait=False)
+            runtime.refresh_prefix(wait=False)
 
         # The mailbox is bounded: it holds at most the *latest* pending request, never a backlog
         # of intermediate ones.
         with runtime._slow_lock:  # noqa: SLF001
             mailbox = runtime._slow_mailbox  # noqa: SLF001
-        assert mailbox is None or mailbox[1] == 1 + n_storm
+        assert mailbox is None or mailbox.source_tick == 1 + n_storm
 
         # The worker drains the mailbox and publishes the freshest completed generation.
         _wait_until(lambda: not runtime._slow_busy)  # noqa: SLF001

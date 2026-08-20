@@ -8,6 +8,7 @@ this extractor is only used for cache precomputation, inference, and tests.
 
 import functools
 import hashlib
+import inspect
 import pathlib
 import sys
 
@@ -69,12 +70,21 @@ def _make_raft_args(dim: int, iters: int, radius: int, block_dims: list[int]):
 
 @functools.lru_cache(maxsize=1)
 def _import_raft():
-    """Import the SEA-RAFT RAFT module, working around its absolute imports."""
+    """Import and validate the patched SEA-RAFT RAFT module."""
+    if not _SEA_RAFT_CORE_DIR.is_dir():
+        raise RuntimeError(
+            "SEA-RAFT submodule is missing. Run `git submodule update --init SEA-RAFT` and "
+            "`uv run python scripts/setup_sea_raft.py`."
+        )
     core_dir = str(_SEA_RAFT_CORE_DIR)
     if core_dir not in sys.path:
         sys.path.insert(0, core_dir)
     from raft import RAFT
 
+    if "return_low_res" not in inspect.signature(RAFT.forward).parameters:
+        raise RuntimeError(
+            "SEA-RAFT is missing FlowPi's return_low_res API. Run `uv run python scripts/setup_sea_raft.py`."
+        )
     return RAFT
 
 
@@ -156,5 +166,9 @@ class SeaRaftFlowExtractor:
         t2 = torch.from_numpy(curr.reshape(b * n_cam, *curr.shape[2:])).to(self._device)
 
         out = self._model(t1, t2, iters=self._iters, test_mode=True, return_low_res=True)
+        if "flow_8x" not in out:
+            raise RuntimeError(
+                "SEA-RAFT return_low_res=True did not return flow_8x. Run `uv run python scripts/setup_sea_raft.py`."
+            )
         flow_8x = out["flow_8x"].cpu().numpy()
         return flow_8x.reshape(b, n_cam, *flow_8x.shape[1:])

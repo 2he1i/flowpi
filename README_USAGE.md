@@ -18,6 +18,20 @@ uv run python -c "import jax; print(jax.devices())"
 
 All dependencies are installed in `.venv/` (JAX GPU, PyTorch cu126, Flax, lerobot).
 
+FlowPi pins the SEA-RAFT source at commit
+`9137517ba24e628442aec097d3afe71d03503b75` and applies the checked-in
+`return_low_res`/`flow_8x` API patch. Initialize and bootstrap it after cloning:
+
+```bash
+git submodule update --init SEA-RAFT
+uv run python scripts/setup_sea_raft.py
+```
+
+The bootstrap script verifies the exact submodule commit, applies the patch once, and fails loudly
+if the dependency is missing, changed, or lacks the required low-resolution output. Training uses
+the resulting frozen implementation through the offline flow cache; inference uses the same code
+online.
+
 ## 2. Dataset
 
 FlowPi uses LeRobot **v3.0** format (parquet with pixel-embedded images).

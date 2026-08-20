@@ -313,6 +313,20 @@ class Pi0(_model.BaseModel):
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
+        loss, _ = self.compute_loss_and_metrics(rng, observation, actions, train=train)
+        return loss
+
+    def compute_loss_and_metrics(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ) -> tuple[at.Float[at.Array, "*b ah"], dict[str, at.Array]]:
+        """The same forward as `compute_loss`, plus a flat dict of training telemetry.
+
+        Metrics (flowpi only; empty dict for baseline configs): the per-batch loss split by noise
+        schedule (πR² vs standard), by horizon position (front / middle / tail third), and by τ
+        bucket, the per-injection-layer gated cross-attention residual ratio r_l = |g_l C_l| / |h_l|,
+        and the fraction of πR² rows. Parameter-level signals (|tanh(gate)|, delay-embedding norm)
+        are computed from the param tree by the training loop (they do not need a forward pass).
+        """
         preprocess_rng, noise_rng, time_rng, mix_rng = jax.random.split(rng, 4)
         geometric_aug = True if self.flow_config is None else self.flow_config.image_geometric_aug
         observation = _model.preprocess_observation(
@@ -368,6 +382,7 @@ class Pi0(_model.BaseModel):
             u_t = noise - actions
             tau = time
             loss_mask = jnp.ones(actions.shape[:-1])
+            is_pir2 = None
 
         # one big forward pass of prefix + suffix at once
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
@@ -380,17 +395,22 @@ class Pi0(_model.BaseModel):
         flow_embedded = self.embed_flow(observation)
         if flow_embedded is not None:
             flow_tokens, flow_token_mask = flow_embedded
-            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+            (prefix_out, suffix_out), _, flow_stats = self.PaliGemma.llm(
                 [prefix_tokens, suffix_tokens],
                 mask=attn_mask,
                 positions=positions,
                 adarms_cond=[None, adarms_cond],
                 flow=flow_tokens,
                 flow_mask=flow_token_mask,
+                return_flow_stats=True,
             )
         else:
-            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-                [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
+            (prefix_out, suffix_out), _, flow_stats = self.PaliGemma.llm(
+                [prefix_tokens, suffix_tokens],
+                mask=attn_mask,
+                positions=positions,
+                adarms_cond=[None, adarms_cond],
+                return_flow_stats=True,
             )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
@@ -398,8 +418,56 @@ class Pi0(_model.BaseModel):
         if self.flow_config is not None and self.pi05 and self.flow_config.use_pir2:
             # Renormalize valid positions so the outer mean matches the baseline π0.5 loss scale.
             valid_count = jnp.maximum(jnp.sum(loss_mask, axis=-1, keepdims=True), 1.0)
-            return jnp.mean(sq, axis=-1) * loss_mask * (horizon / valid_count)
-        return jnp.mean(sq, axis=-1)
+            loss = jnp.mean(sq, axis=-1) * loss_mask * (horizon / valid_count)
+            return loss, self._flow_loss_metrics(loss, sq, is_pir2, tau, loss_mask, flow_stats)
+        return jnp.mean(sq, axis=-1), {}
+
+    def _flow_loss_metrics(
+        self,
+        loss: at.Float[at.Array, "*b ah"],
+        sq: at.Float[at.Array, "*b ah ad"],
+        is_pir2: at.Bool[at.Array, " *b"],
+        tau: at.Float[at.Array, " *b ah"],
+        loss_mask: at.Float[at.Array, " *b ah"],
+        flow_stats: at.Float[at.Array, " _slots"],
+    ) -> dict[str, at.Array]:
+        """Telemetry from the πR² loss forward (one shared computation, no extra forward)."""
+        metrics: dict[str, at.Array] = {}
+        sq_f = sq.astype(jnp.float32)
+        loss_f = loss.astype(jnp.float32)
+        pir2 = is_pir2.astype(jnp.float32)
+
+        def masked_mean(values: at.Array, mask: at.Array) -> at.Array:
+            m = mask.astype(jnp.float32)
+            return jnp.sum(values * m) / (jnp.sum(m) + 1e-8)
+
+        metrics["frac_pir2"] = jnp.mean(pir2)
+        # Per-row masks divide by n_rows * H so the weighted combination reproduces the outer
+        # (renormalized) loss mean exactly; masked positions carry loss_f = 0.
+        horizon = self.action_horizon
+        horizon_f = jnp.float32(horizon)
+        metrics["loss_pir2"] = jnp.sum(loss_f * pir2[:, None]) / (jnp.sum(pir2) * horizon_f + 1e-8)
+        metrics["loss_standard"] = jnp.sum(loss_f * (1.0 - pir2)[:, None]) / (jnp.sum(1.0 - pir2) * horizon_f + 1e-8)
+
+        horizon = self.action_horizon
+        per_pos = jnp.mean(sq_f, axis=-1)  # [B, H]
+        pos = jnp.arange(horizon)
+        third = horizon // 3
+        for name, (lo, hi) in (("front", (0, third)), ("mid", (third, 2 * third)), ("tail", (2 * third, horizon))):
+            mask = ((pos >= lo) & (pos < hi)).astype(jnp.float32)[None, :] * loss_mask
+            metrics[f"loss_{name}_third"] = masked_mean(per_pos, mask)
+        for name, (lo, hi) in (
+            ("low", (0.0, 1.0 / 3.0)),
+            ("mid", (1.0 / 3.0, 2.0 / 3.0)),
+            ("high", (2.0 / 3.0, 1.0)),
+        ):
+            mask = ((tau >= lo) & (tau < hi)).astype(jnp.float32) * loss_mask
+            metrics[f"loss_tau_{name}"] = masked_mean(per_pos, mask)
+
+        if flow_stats is not None:
+            for slot, layer in enumerate(self.flow_config.injection_layers):
+                metrics[f"flow_ca_residual_ratio_layer{layer}"] = flow_stats[slot]
+        return metrics
 
     @override
     def sample_actions(

@@ -9,6 +9,10 @@ Output layout:
   {flow_cache_dir}/episode-{ep:06d}/{cam_key}.npy   # [T, K, 2, H//8, W//8] float16 (raw)
   {flow_cache_dir}/episode-{ep:06d}/valid.npy       # [T, K] bool
 
+Episode -> parquet-row indexing is *not* reimplemented here: `LeRobotV3ParquetDataset` is the
+single source of truth (see `episode_frames`), so episodes sharing a parquet file are sliced to
+their own row range and multi-file datasets stay aligned with the training loader.
+
 Usage:
   uv run python scripts/precompute_flow_cache.py --config-name flowpi_aloha \
       [--data.flow.sea-raft-ckpt /path/to/sea_raft.pth] [--max-frames 20] [--num-workers 4]
@@ -16,13 +20,10 @@ Usage:
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor
-import io
 import json
 import pathlib
 
 import numpy as np
-from PIL import Image
-import pyarrow.parquet as pq
 from tqdm import tqdm
 import tyro
 
@@ -41,41 +42,12 @@ def _parse_args():
 
 
 def _episode_entries(root: pathlib.Path) -> list[dict]:
-    entries = []
-    for path in sorted((root / "meta" / "episodes").rglob("*.parquet")):
-        table = pq.read_table(path)
-        columns = table.column_names
-        chunk_col = "data/chunk_index" if "data/chunk_index" in columns else "chunk_index"
-        file_col = "data/file_index" if "data/file_index" in columns else "file_index"
-        entries.extend(
-            {
-                "episode_index": int(table.column("episode_index")[row].as_py()),
-                "length": int(table.column("length")[row].as_py()),
-                "chunk_index": int(table.column(chunk_col)[row].as_py()),
-                "file_index": int(table.column(file_col)[row].as_py()),
-            }
-            for row in range(table.num_rows)
-        )
-    entries.sort(key=lambda e: e["episode_index"])
-    return entries
+    """Episode metadata (index + length). Indexing is delegated to
+    `LeRobotV3ParquetDataset.episode_frames` at decode time; only the episode list is read here."""
+    from openpi.training.lerobot_v3_dataset import LeRobotV3ParquetDataset
 
-
-def _decode_episode_frames(root: pathlib.Path, entry: dict, cam_keys: list[str]) -> dict[str, np.ndarray]:
-    """Decodes all frames of one episode for every camera -> {cam: [T, 3, H, W] uint8}."""
-    path = root / "data" / f"chunk-{entry['chunk_index']:03d}" / f"file-{entry['file_index']:03d}.parquet"
-    table = pq.read_table(path, columns=cam_keys)
-    out = {}
-    for cam in cam_keys:
-        frames = []
-        for row in range(table.num_rows):
-            item = table.column(cam)[row].as_py()
-            img = Image.open(io.BytesIO(item["bytes"]))
-            arr = np.asarray(img)
-            if arr.ndim == 2:
-                arr = np.stack([arr] * 3, axis=-1)
-            frames.append(np.transpose(arr, (2, 0, 1)))
-        out[cam] = np.stack(frames, axis=0)
-    return out
+    dataset = LeRobotV3ParquetDataset(root)
+    return [{"episode_index": ep.episode_index, "length": ep.length} for ep in dataset.episodes]
 
 
 def _cache_name(cam_key: str) -> str:
@@ -86,6 +58,7 @@ def _cache_name(cam_key: str) -> str:
 
 def _process_episode(task: dict) -> dict:
     """Worker: computes and saves the flow cache for one episode."""
+    from openpi.training.lerobot_v3_dataset import LeRobotV3ParquetDataset
     from openpi.training.sea_raft import SeaRaftFlowExtractor
 
     extractor = SeaRaftFlowExtractor(
@@ -98,9 +71,23 @@ def _process_episode(task: dict) -> dict:
     entry = task["entry"]
     k_num, stride, batch_size = task["num_flow_steps"], task["flow_stride_frames"], task["batch_size"]
 
-    frames = _decode_episode_frames(root, entry, task["cam_keys"])
+    # Single source of truth for episode -> parquet rows: the same dataset reader used by the
+    # training loader decodes exactly the episode's local row range (never a whole file, so
+    # multi-episode / multi-file datasets stay aligned with training).
+    dataset = LeRobotV3ParquetDataset(root)
+    frames = dataset.episode_frames(entry["episode_index"])
+    t_len = next(iter(frames.values())).shape[0]
+    # With --max-frames the entry length was truncated in main(); the decoded rows must cover
+    # at least that many frames (and exactly the metadata length when untruncated).
+    if t_len < entry["length"] or (task.get("max_frames") is None and t_len != entry["length"]):
+        raise ValueError(
+            f"Episode {entry['episode_index']}: metadata length {entry['length']} but the parquet "
+            f"rows decoded to {t_len} frames. Episode metadata and data files are inconsistent."
+        )
+    # --max-frames truncates the cache (smoke runs) per episode, never crossing into another
+    # episode's rows (the metadata length was already truncated in main()).
     if task.get("max_frames") is not None:
-        frames = {cam: arr[: task["max_frames"]] for cam, arr in frames.items()}
+        frames = {cam: arr[: entry["length"]] for cam, arr in frames.items()}
     t_len = next(iter(frames.values())).shape[0]
     _, _, height, width = next(iter(frames.values())).shape
 

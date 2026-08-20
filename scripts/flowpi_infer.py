@@ -58,6 +58,13 @@ def main():
     parser.add_argument("--control-hz", type=float, default=50.0, help="Control frequency in realtime mode (Hz)")
     parser.add_argument("--jax-device", type=str, default=None, help="JAX model device (e.g. cuda:0 / gpu:1)")
     parser.add_argument("--sea-raft-device", type=str, default=None, help="SEA-RAFT torch device (e.g. cuda:0)")
+    parser.add_argument(
+        "--telemetry-json",
+        type=pathlib.Path,
+        default=None,
+        help="Dump per-tick freshness telemetry + timing stats to a JSON file (for "
+        "scripts/fit_vlm_delay.py). Use --realtime for deployment-equivalent delays.",
+    )
     args = parser.parse_args()
 
     # Load the config and create the model.
@@ -208,6 +215,18 @@ def main():
     if runtime.stats.get("prefix_age_ms_at_install"):
         arr = np.array(runtime.stats["prefix_age_ms_at_install"])
         print(f"prefix_age_ms_at_install: mean={arr.mean():.1f}ms, max={arr.max():.1f}ms, n={len(arr)}")
+
+    if args.telemetry_json is not None:
+        payload = {
+            "vlm_delay_max": flow_cfg.vlm_delay_max,
+            "telemetry": runtime.telemetry,
+            "stats": {name: vals for name, vals in runtime.stats.items() if vals},
+        }
+        with open(args.telemetry_json, "w") as f:
+            import json
+
+            json.dump(payload, f, indent=2)
+        print(f"Wrote telemetry to {args.telemetry_json}")
 
 
 if __name__ == "__main__":

@@ -133,6 +133,25 @@ def init_train_state(
     return train_state, state_sharding
 
 
+def _flow_param_metrics(config: _config.TrainConfig, params: nnx.State) -> dict[str, at.Array]:
+    """Parameter-level flowpi telemetry (no forward pass): per-injection-layer |tanh(gate)| and
+    the delay-embedding norm. Gates are zero-initialized, so these track whether the CA injection
+    and the delay conditioning actually turn on during training."""
+    flow = getattr(config.model, "flow", None)
+    if flow is None or not flow.enabled:
+        return {}
+    metrics: dict[str, at.Array] = {}
+    gates = jax.tree.leaves(params.filter(nnx_utils.PathRegex(".*flow_gate.*")))
+    if gates:
+        g = gates[0]  # [n_slots, width]
+        for slot, layer in enumerate(flow.injection_layers):
+            metrics[f"flow_gate_tanh_abs_layer{layer}"] = jnp.mean(jnp.abs(jnp.tanh(g[slot].astype(jnp.float32))))
+    delay_emb = jax.tree.leaves(params.filter(nnx_utils.PathRegex(".*flow_vlm_delay_fast.*embedding.*")))
+    if delay_emb:
+        metrics["flow_delay_emb_norm"] = jnp.sqrt(jnp.mean(jnp.square(delay_emb[0].astype(jnp.float32))))
+    return metrics
+
+
 @at.typecheck
 def train_step(
     config: _config.TrainConfig,
@@ -143,19 +162,27 @@ def train_step(
     model = nnx.merge(state.model_def, state.params)
     model.train()
 
+    flow = getattr(config.model, "flow", None)
+    use_flow_metrics = flow is not None and flow.enabled
+
     @at.typecheck
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
+        if use_flow_metrics:
+            chunked_loss, metrics = model.compute_loss_and_metrics(rng, observation, actions, train=True)
+            return jnp.mean(chunked_loss), metrics
         chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        return jnp.mean(chunked_loss), {}
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    (loss, metrics), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+        model, train_rng, observation, actions
+    )
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -187,6 +214,8 @@ def train_step(
         "loss": loss,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
+        **metrics,
+        **_flow_param_metrics(config, new_params),
     }
     return new_state, info
 

@@ -384,17 +384,31 @@ class Block(nn.Module):
             def inject(h):
                 hn = _flow_rmsnorm(h, flow_params["flow_pre_norm_scale"][flow_slot])
                 ca = _flow_cross_attn(hn, flow, flow_mask, flow_params, flow_slot, head_dim=head_dim)
-                return h + jnp.tanh(flow_params["flow_gate"][flow_slot]).astype(h.dtype) * ca.astype(h.dtype)
+                g = jnp.tanh(flow_params["flow_gate"][flow_slot]).astype(h.dtype)
+                h_out = h + g * ca.astype(h.dtype)
+                # Telemetry: magnitude of the gated CA residual relative to the hidden state at
+                # this layer (r_l = |g_l C_l| / |h_l|), a float32 scalar per batch element.
+                ratio = jnp.mean(jnp.abs(g * ca.astype(h.dtype)), dtype=jnp.float32) / (
+                    jnp.mean(jnp.abs(h), dtype=jnp.float32) + 1e-6
+                )
+                return h_out, ratio
+
+            def no_inject(h):
+                return h, jnp.zeros((), dtype=jnp.float32)
 
             # Non-injection layers skip the cross-attention matmul entirely. Prefix-only passes
             # (expert 1 is None) skip injection as well.
             if xs[1] is not None:
-                new_h = jax.lax.cond(flow_slot >= 0, inject, lambda h: h, xs[1])
+                new_h, flow_stat = jax.lax.cond(flow_slot >= 0, inject, no_inject, xs[1])
                 xs = [xs[0], new_h]
+            else:
+                flow_stat = jnp.zeros((), dtype=jnp.float32)
+        else:
+            flow_stat = jnp.zeros((), dtype=jnp.float32)
 
         xs = sharding.activation_sharding_constraint(xs)
 
-        return xs, kv_cache
+        return xs, (kv_cache, flow_stat)
 
 
 KVCache: TypeAlias = tuple[at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array, "l b _t _v _h"]]
@@ -518,7 +532,11 @@ class Module(nn.Module):
         flow_mask: at.Bool[at.Array, "b _f"] | None = None,
         kv_cache: KVCache | None = None,
         deterministic: bool = True,
-    ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
+        return_flow_stats: bool = False,
+    ) -> (
+        tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]
+        | tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache, at.Float[at.Array, " _slots"]]
+    ):
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
@@ -544,15 +562,24 @@ class Module(nn.Module):
             flow = None
             flow_mask = None
 
-        embedded, kv_cache = self.layers(
+        embedded, (kv_cache, flow_stats) = self.layers(
             embedded, kv_cache, flow, flow_mask, flow_params, flow_slot, positions, mask, adarms_cond, deterministic
         )
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
 
-        return [
+        outputs = [
             f(e, a)[0] if e is not None else e for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
-        ], kv_cache
+        ]
+        if not return_flow_stats:
+            return outputs, kv_cache
+        # Per-slot CA residual ratios (0.0 for non-injection layers); when the flow branch is
+        # disabled the per-slot values are all zero.
+        if self.flow_geom is None:
+            flow_stats = jnp.zeros((len(self.flow_geom or ()),), dtype=jnp.float32)
+        else:
+            flow_stats = flow_stats[jnp.asarray(self.flow_geom.injection_layers)]
+        return outputs, kv_cache, flow_stats
 
     def init(self, use_adarms: Sequence[bool]):
         """Convenience method for initializing all parameters, necessary due to the quirks of linen."""

@@ -52,7 +52,7 @@
 
 **Files changed/added:**
 - `src/openpi/policies/flowpi_runtime.py`: `FlowPiRuntime` with frame ring buffer, online SEA-RAFT flow per tick, background prefix refresh
-- `src/openpi/policies/flowpi_runtime_test.py`: 1 test (CPU, passes ~7 min on GPU)
+- `src/openpi/policies/flowpi_runtime_test.py`: 1 test
 - `scripts/flowpi_infer.py`: offline replay CLI
 - `src/openpi/models/gemma.py`: fixed `flow=None` fallback path (batch_size from first non-None embedded)
 - `flowpi_plan/HANDOVER.md`: agent handover document
@@ -62,27 +62,50 @@
 2. Duplicate `preprocess_observation` — `_prefix_forward` had preprocessing added but `warm_start`/`refresh_prefix` already preprocessed. Reverted in `_prefix_forward`, moved to runtime's `refresh_prefix`.
 3. Test assertion bug — test expected `_prefix_age == i` regardless of refresh resets. Fixed with `expected_age = i - ((i-1)//5)*5`.
 
-**Known limitation**: The runtime reads KV cache via `_slow_lock` in `tick()` but does not yet swap it into the streaming state (the background refresh thread KV cache is cached but not propagated before `denoise_step`). This does not affect the offline test but should be addressed before real deployment.
-
 ## M6 — Documentation
 
 **Files added:**
 - `flowpi_plan/README_USAGE.md`: complete usage guide
 - `flowpi_plan/IMPLEMENTATION_NOTES.md`: this document
 
+## Review Fixes (GPT-review pass, main branch)
+
+### P0 — Offline cache correctness
+- `src/openpi/training/lerobot_v3_dataset.py`: rewritten indexing — the parquet shim now maps global dataset indices to `(chunk, file, row)` via per-file episode metadata (`episode_frames`, `episodes`) instead of assuming a single contiguous file, and validates that episodes sharing a parquet file tile the global index range contiguously (`itertools.pairwise` in `_file_index_range`).
+- `scripts/precompute_flow_cache.py`: rewritten around `episode_frames` — the cache no longer indexes flow rows by an episode-relative offset computed from a single shared `frame_offsets`; it slices each episode's frames by its own flow-frame range so the cache rows line up exactly with the data loader's `LoadFlowCache` reads.
+- NEW `src/openpi/policies/flowpi_e2e_test.py` (2 tests): proves the offline cache and the streaming runtime produce bit-identical flow inputs (`test_cache_flow_equals_runtime_flow`) and that `DelaySlowImage` produces exactly the delayed frame the runtime's prefix refresh would (delay semantics equivalence, including clamping at episode start). Both run the real SEA-RAFT precompute once per session (module-scoped fixture).
+  - Encoding detail: the runtime's `(img + 1) * 127.5 → clip → uint8` round-trip fails for 63/256 u8 values after `u8/127.5 - 1`; `_item_to_obs` bumps one ulp via `np.nextafter` so the round-trip is exact for all 256 levels (verified empirically).
+- `src/openpi/policies/flowpi_runtime_test.py`: now asserts against `runtime._ring.base_index` (was `_frame_index`) and passes with the E2E tolerance.
+
+### P1 — Delay distribution & training telemetry
+- `src/openpi/models/pi0_config.py`: `FlowConfig.vlm_delay_distribution: tuple[float, ...] | None` — optional training-time histogram over `[0, vlm_delay_max]`, validated at construction (length `vlm_delay_max + 1`, non-negative weights, positive mass).
+- `src/openpi/transforms.py`: `DelaySlowImage(distribution=...)` samples the delay categorically from the fitted histogram, renormalized over the delays reachable at each frame (`[0, min(vlm_delay_max, frame_index)]`, matching the runtime's clamping); falls back to uniform when the fitted mass lies entirely beyond the reachable range (early episode).
+- NEW `scripts/fit_vlm_delay.py`: fits the histogram from `flowpi_infer.py --realtime --telemetry-json` output — prints the delay histogram, P99 → recommended `vlm_delay_max`, and the `0.8 · P̂ + 0.2 · U` smoothed weights to paste into `FlowConfig`.
+- `scripts/flowpi_infer.py`: new `--telemetry-json PATH` option dumps per-tick `vlm_delay_max` / `telemetry` / `stats` for the fitter.
+- `src/openpi/models/gemma.py`: `Block` now also returns the per-layer gated cross-attention residual ratio `r_l = |g_l C_l| / |h_l|` (float32 scalar; 0.0 for non-injection layers), stacked by the layer scan; `Module.__call__(return_flow_stats=True)` returns `(outputs, kv_cache, flow_stats)` with the ratios sliced to the injection layers. The scan's return stays `(carry, ys)` — the ratio rides in the `ys` tree.
+- `src/openpi/models/pi0.py`: `compute_loss_and_metrics` — same forward as `compute_loss` plus a flat telemetry dict (empty for baseline configs): `frac_pir2`, `loss_standard`/`loss_pir2` (per-row masks dividing by `n_rows · H` so the weighted combination reproduces the outer renormalized loss mean exactly), `loss_{front,mid,tail}_third`, `loss_tau_{low,mid,high}`, and per-injection-layer `flow_ca_residual_ratio_layer{l}`. `compute_loss` delegates.
+- `scripts/train.py`: `loss_fn` returns `(mean_loss, metrics)` through `nnx.value_and_grad(..., has_aux=True)`; `train_step` merges the forward metrics with parameter-level telemetry from the post-update param tree (`flow_gate_tanh_abs_layer{l}` = mean `|tanh(gate)|` per injection layer, `flow_delay_emb_norm` = delay-embedding RMS) via `nnx_utils.PathRegex`.
+- `src/openpi/training/config.py`: NEW `debug_flow` training config (dummy variants + flow), exercised by `scripts/train_test.py` which is now parametrized over `["debug", "debug_flow"]` and no longer forces `JAX_PLATFORMS=cpu` (tests run on GPU).
+
+### P2 — Documentation (this file)
+- Removed the "KV cache swap is not implemented" limitation: `_slow_lock` read-back + `refresh_prefix` KV swap into the streaming state **is** implemented and covered by `test_prefix_refresh_swaps_kv_and_carries_source_tick` (flowpi_test.py) and the E2E delay-semantics test.
+
 ## Ruff Status
 
-Ruff auto-fix was applied to M5 files. Remaining warnings/errors in `src/` and `scripts/` are pre-existing from M1-M4 (unused imports, `# noqa` directives for disabled rules, PERF401 suggestions, etc.). A full cleanup pass was not completed.
+All `src/openpi` and `scripts` files touched by the review fixes pass `ruff check` and `ruff format --check`. Pre-existing warnings from M1-M4 in untouched files remain.
 
 ## Test Summary
 
 | Test File | Tests | Status |
 |-----------|-------|--------|
-| `flowpi_test.py` (M3) | 8 | All passing |
+| `flowpi_test.py` (M3) | 16 | All passing |
 | `pi0_test.py` (baseline) | 4 | All passing |
 | `flowpi_runtime_test.py` (M5) | 1 | Passing |
 | `sea_raft_test.py` (M1) | 3 | All passing (per M1 commit) |
-| `data_loader_flow_test.py` (M2) | 4 | All passing (per M2 commit) |
+| `data_loader_flow_test.py` (M2) | 9 | All passing |
+| `lerobot_v3_dataset_test.py` (P0) | 8 | All passing |
+| `flowpi_e2e_test.py` (P0) | 2 | All passing (~4 min, real SEA-RAFT) |
+| `train_test.py` | 2 (`debug`, `debug_flow`) | All passing |
 
 ## Known Limitations
 
@@ -90,6 +113,3 @@ Ruff auto-fix was applied to M5 files. Remaining warnings/errors in `src/` and `
 2. **PyTorch path unsupported**: `models_pytorch` training path does not support FlowPi features.
 3. **lerobot v3.0 shim**: The installed lerobot version (0.1.0) does not support v3.0 datasets natively. The `lerobot_v3_dataset.py` shim works but should be replaced when lerobot is upgraded.
 4. **Dummy variant requires GPU**: The dummy SigLIP (`paligemma_variant="dummy"`) still loads the real vision tower.
-5. **Ruff not fully clean**: Pre-existing warnings from M1-M4 remain. No functional impact.
-6. **Runtime KV cache swap**: Background refresh KV cache is stored but not propagated to the streaming state during ticks (see M5 known limitation above).
-", "filePath": "/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/zheli/DOMINO/policy/flowPi/flowpi_plan/IMPLEMENTATION_NOTES.md"}

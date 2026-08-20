@@ -350,7 +350,11 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
                         )
                     )
             if self.flow.sample_vlm_delay:
-                flow_transforms.append(_transforms.DelaySlowImage(model_flow.vlm_delay_max, frame_offsets, seed=0))
+                flow_transforms.append(
+                    _transforms.DelaySlowImage(
+                        model_flow.vlm_delay_max, frame_offsets, seed=0, distribution=model_flow.vlm_delay_distribution
+                    )
+                )
             if flow_transforms:
                 data_transforms = _transforms.Group(
                     inputs=[*flow_transforms, *data_transforms.inputs],
@@ -1166,6 +1170,29 @@ _CONFIGS = [
         save_interval=100,
         overwrite=True,
         exp_name="debug",
+        num_train_steps=10,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="debug_flow",
+        data=FakeDataConfig(),
+        batch_size=2,
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            discrete_state_input=True,
+            paligemma_variant="dummy",
+            action_expert_variant="dummy",
+            flow=pi0_config.FlowConfig(
+                num_flow_steps=2,
+                flow_stride_frames=3,
+                d_max=2,
+                injection_layers=(1, 2),  # dummy action-expert depth is 4
+                vlm_delay_max=3,
+            ),
+        ),
+        save_interval=100,
+        overwrite=True,
+        exp_name="debug_flow",
         num_train_steps=10,
         wandb_enabled=False,
     ),

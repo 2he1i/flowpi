@@ -541,11 +541,29 @@ class DelaySlowImage(DataTransformFn):
     further back than the episode start).
     """
 
-    def __init__(self, vlm_delay_max: int, frame_offsets: tuple[int, ...], *, seed: int = 0):
+    def __init__(
+        self,
+        vlm_delay_max: int,
+        frame_offsets: tuple[int, ...],
+        *,
+        seed: int = 0,
+        distribution: Sequence[float] | None = None,
+    ):
         self.vlm_delay_max = vlm_delay_max
         self.frame_offsets = tuple(frame_offsets)
         self.seed = seed
         self._calls = 0
+        self.distribution = None if distribution is None else np.asarray(list(distribution), dtype=np.float64)
+        if self.distribution is not None:
+            if len(self.distribution) != vlm_delay_max + 1:
+                raise ValueError(
+                    f"delay distribution must have vlm_delay_max+1={vlm_delay_max + 1} weights "
+                    f"(one per delay in [0, vlm_delay_max]), got {len(self.distribution)}"
+                )
+            if np.any(self.distribution < 0) or self.distribution.sum() <= 0:
+                raise ValueError(
+                    f"delay distribution weights must be non-negative with a positive sum, got {self.distribution}"
+                )
 
     def __call__(self, data: DataDict) -> DataDict:
         images = data.get("images", {})
@@ -566,7 +584,16 @@ class DelaySlowImage(DataTransformFn):
             pass
         rng = np.random.default_rng(np.random.SeedSequence([self.seed, worker_id, self._calls]))
         self._calls += 1
-        d_vlm = int(rng.integers(0, max_d + 1))
+        if self.distribution is None:
+            d_vlm = int(rng.integers(0, max_d + 1))
+        else:
+            # Categorical sampling from the fitted histogram, renormalized over the delays actually
+            # reachable at this frame (early in an episode the delay can never exceed frame_index,
+            # matching the runtime's clamping). If the fitted mass lies entirely beyond the
+            # reachable range, fall back to uniform over the reachable delays.
+            p = self.distribution[: max_d + 1]
+            total = p.sum()
+            d_vlm = int(rng.choice(max_d + 1, p=p / total)) if total > 0 else int(rng.integers(0, max_d + 1))
 
         idx = frame_offset_index(self.frame_offsets, -d_vlm) if d_vlm > 0 else frame_offset_index(self.frame_offsets, 0)
         data["images"] = {cam: np.asarray(stack)[idx] for cam, stack in images.items()}

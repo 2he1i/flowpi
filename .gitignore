@@ -7,6 +7,9 @@ wandb/
 # Local opencode config (permission auto-approve rules, machine-specific).
 opencode.json
 
+# Agent instructions (machine-specific, not for the repo).
+AGENTS.md
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

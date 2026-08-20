@@ -41,6 +41,13 @@ class FlowConfig:
     tau_jitter: float = 0.01
     # Slow channel delay.
     vlm_delay_max: int = 10
+    # Optional training-time sampling distribution for the slow-channel delay d, as a histogram
+    # over [0, vlm_delay_max] (weights need not sum to 1; normalized at use). None (default)
+    # samples uniformly over [0, min(vlm_delay_max, frame_index)], exactly as before. Fit the
+    # histogram from runtime prefix-age telemetry with `scripts/fit_vlm_delay.py`; the recommended
+    # smoothing (0.8 * fitted + 0.2 * uniform) keeps a non-zero training mass on every delay so
+    # the fast Action Expert never sees an out-of-distribution (rare but reachable) delay.
+    vlm_delay_distribution: tuple[float, ...] | None = None
     # Ablation toggles. These gate the *use* of a channel in the forward pass but never the
     # parameter layout: the flow modules are always created when `enabled`, so every flowpi
     # configuration (including ablations) shares one architecture and can load the same
@@ -80,6 +87,20 @@ class FlowConfig:
             raise ValueError(f"tau_jitter must be in [0, 1), got {self.tau_jitter}")
         if self.vlm_delay_max < 0:
             raise ValueError(f"vlm_delay_max must be non-negative, got {self.vlm_delay_max}")
+        if self.vlm_delay_distribution is not None:
+            if len(self.vlm_delay_distribution) != self.vlm_delay_max + 1:
+                raise ValueError(
+                    f"vlm_delay_distribution must have vlm_delay_max+1={self.vlm_delay_max + 1} weights "
+                    f"(one per delay in [0, vlm_delay_max]), got {len(self.vlm_delay_distribution)}"
+                )
+            if any(p < 0 for p in self.vlm_delay_distribution):
+                raise ValueError(
+                    f"vlm_delay_distribution weights must be non-negative, got {self.vlm_delay_distribution}"
+                )
+            if sum(self.vlm_delay_distribution) <= 0:
+                raise ValueError(
+                    f"vlm_delay_distribution must have at least one positive weight, got {self.vlm_delay_distribution}"
+                )
         if self.num_cross_heads <= 0:
             raise ValueError(f"num_cross_heads must be positive, got {self.num_cross_heads}")
         if self.cross_head_dim <= 0:

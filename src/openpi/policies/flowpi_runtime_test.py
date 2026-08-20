@@ -314,9 +314,9 @@ def test_cross_episode_prefix_is_dropped():
         runtime.tick(_obs_for(0.25, 1))
         assert runtime._prefix_source_tick == 0  # noqa: SLF001
         kv_now = jax.tree.leaves(runtime._streaming_state.kv_cache)  # noqa: SLF001
-        assert all(np.array_equal(np.asarray(a), np.asarray(b)) for a, b in zip(kv_now, kv_old, strict=True)), (
-            "stale episode prefix was installed"
-        )
+        assert all(
+            np.array_equal(np.asarray(a), np.asarray(b)) for a, b in zip(kv_now, kv_old, strict=True)
+        ), "stale episode prefix was installed"
         assert runtime.num_generation_drops >= 1
     finally:
         runtime.close()

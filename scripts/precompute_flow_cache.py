@@ -174,14 +174,22 @@ def main():
 
     entries = _episode_entries(local_root)
     if extra.max_frames is not None:
+        if extra.max_frames <= 0:
+            raise ValueError("--max-frames must be positive")
         remaining = extra.max_frames
+        selected_entries = []
         for entry in entries:
-            take = min(entry["length"], remaining)
-            entry["length"] = take
-            remaining -= take
             if remaining <= 0:
-                entries = [e for e in entries if e["length"] > 0]
                 break
+            take = min(entry["length"], remaining)
+            if take <= 0:
+                continue
+            selected_entries.append({**entry, "length": take})
+            remaining -= take
+        entries = selected_entries
+
+    if not entries:
+        raise ValueError("No episode frames selected for flow-cache precomputation.")
 
     tasks = [
         {

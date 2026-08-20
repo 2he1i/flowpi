@@ -1,4 +1,4 @@
-"""Offline replay of a FlowPi model on a dataset episode.
+"""Offline replay of a FlowPi model on one or more dataset episodes.
 
 The replay feeds the runtime the *fresh* observation pipeline (current frames, state, prompt) —
 exactly what online deployment produces. The runtime itself computes the online SEA-RAFT flow
@@ -42,6 +42,18 @@ import openpi.training.data_loader as _data_loader
 import openpi.transforms as _transforms
 
 
+def _preserve_episode_index(group: _transforms.Group) -> _transforms.Group:
+    """Keep the raw episode id through the replay-only repack transform."""
+    inputs = list(group.inputs)
+    for index, transform in enumerate(inputs):
+        if isinstance(transform, _transforms.RepackTransform):
+            structure = dict(transform.structure)
+            structure.setdefault("episode_index", "episode_index")
+            inputs[index] = dataclasses.replace(transform, structure=structure)
+            return dataclasses.replace(group, inputs=tuple(inputs))
+    raise ValueError("Replay requires a RepackTransform so it can detect episode boundaries.")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config-name", required=True, help="Training config name (e.g. flowpi_aloha)")
@@ -66,6 +78,12 @@ def main():
         "scripts/fit_vlm_delay.py). Use --realtime for deployment-equivalent delays.",
     )
     args = parser.parse_args()
+    if args.slow_every_n <= 0:
+        raise ValueError("--slow-every-n must be positive")
+    if args.control_hz <= 0:
+        raise ValueError("--control-hz must be positive")
+    if args.max_frames is not None and args.max_frames <= 0:
+        raise ValueError("--max-frames must be positive")
 
     # Load the config and create the model.
     train_config = _config.get_config(args.config_name)
@@ -87,6 +105,7 @@ def main():
     # the batch carries 480x640 images (the model preprocessor resizes to 224x224 internally).
     runtime_data_config = dataclasses.replace(
         runtime_data_config,
+        repack_transforms=_preserve_episode_index(runtime_data_config.repack_transforms),
         model_transforms=_transforms.Group(
             inputs=tuple(
                 t for t in runtime_data_config.model_transforms.inputs if not isinstance(t, _transforms.ResizeImages)
@@ -143,21 +162,28 @@ def main():
     # invert the delta/absolute repack.
     all_outputs: list[tuple[np.ndarray, np.ndarray]] = []
     period = 1.0 / args.control_hz
+    active_episode_index: int | None = None
 
     for frame_idx, batch in enumerate(loader):
         if frame_idx >= frame_count:
             break
         obs = _model.Observation.from_dict(batch)
 
-        if frame_idx == 0:
-            # First frame: warm start + synchronous initial prefix refresh (must be active
-            # before the first fast tick).
+        episode_values = np.asarray(batch.get("episode_index", [])).reshape(-1)
+        if episode_values.size != 1:
+            raise ValueError(
+                "Replay could not recover exactly one episode_index per frame. "
+                "Use a LeRobot v3 dataset with episode_index in its metadata."
+            )
+        episode_index = int(episode_values[0])
+        if active_episode_index != episode_index:
+            # First frame of each episode: warm_start resets all temporal state and already
+            # installs the initial prefix before the first fast tick.
             runtime.warm_start(obs)
-            runtime.refresh_prefix(obs, wait=True)
-            # Emit the initial in-flight actions.
             emit = runtime.emit()
             all_actions.append(emit)
             all_outputs.append((emit, np.asarray(obs.state[0])))
+            active_episode_index = episode_index
             continue
 
         # Fast tick (paced to the control period in realtime mode).
@@ -168,16 +194,16 @@ def main():
         all_actions.append(acts)
         all_outputs.append((acts, np.asarray(obs.state[0])))
 
+        # Launch the next slow refresh before pacing the tick. Its worker can now overlap the
+        # remaining control-period sleep instead of starting one full tick late.
+        if frame_idx % args.slow_every_n == 0:
+            runtime.refresh_prefix(obs)
+
         if args.realtime:
             elapsed = time.perf_counter() - loop_t0
             if elapsed < period:
                 time.sleep(period - elapsed)
         runtime.stats["tick_wall_ms"].append((time.perf_counter() - loop_t0) * 1000)
-
-        # Slow-channel refresh (async: the prefill runs in the background and is installed at
-        # the next fast tick, so the replay loop never blocks on the VLM).
-        if frame_idx % args.slow_every_n == 0:
-            runtime.refresh_prefix(obs)
 
     # Drain the slow worker and propagate any prefill exception to the main thread.
     runtime.close()

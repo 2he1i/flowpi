@@ -122,9 +122,9 @@ class FlowPiRuntime:
 
     Usage (offline replay on a dataset episode, 50 Hz, d=1 per tick)::
 
-        runtime = FlowPiRuntime(model, flow_config=..., sea_raft_ckpt=..., device="cuda")
+        runtime = FlowPiRuntime(model, flow_config=..., sea_raft_ckpt=..., sea_raft_device="cuda")
         runtime.warm_start(first_observation)
-        runtime.refresh_prefix(first_observation, wait=True)   # initial slow-channel fill
+        # warm_start already creates and installs the initial prefix
         for frame_idx in range(1, episode_length):
             obs = dataset[frame_idx]                # (Observation state, images)
             actions = runtime.tick(obs)
@@ -370,10 +370,11 @@ class FlowPiRuntime:
             self._pending_prefix = PrefixGeneration(episode_id, source_tick, kv_cache, prefix_mask)
 
     def warm_start(self, observation: _model.Observation) -> None:
-        """Begin a new episode: initialise ring buffer, run warm_start.
+        """Begin a new episode and synchronously install its initial slow prefix.
 
-        The caller should call ``refresh_prefix(observation, wait=True)`` before the first
-        ``tick``. Any in-flight slow refresh of the previous episode is invalidated.
+        Any in-flight slow refresh of the previous episode is invalidated. The returned
+        streaming state is ready for ``emit`` and the first ``tick``; an initial
+        ``refresh_prefix(..., wait=True)`` is unnecessary.
         """
         self._check_slow_errors()
         # A new episode starts from an empty ring buffer: stale frames of the previous episode
@@ -510,6 +511,10 @@ class FlowPiRuntime:
         episode_id = self._episode_id
         source_tick = self._frame_index
         if wait:
+            # warm_start and a repeated synchronous refresh for the same frame refer to the
+            # already-active prefix. Keep the old call pattern a harmless no-op.
+            if self._streaming_state is not None and source_tick == self._prefix_source_tick:
+                return
             kv_cache, prefix_mask = self._prefill(observation)
             self._publish(episode_id=episode_id, source_tick=source_tick, kv_cache=kv_cache, prefix_mask=prefix_mask)
             return

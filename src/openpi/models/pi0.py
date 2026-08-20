@@ -471,15 +471,14 @@ class Pi0(_model.BaseModel):
                 metrics[f"flow_ca_residual_ratio_layer{layer}"] = flow_stats[slot]
         return metrics
 
-    @override
-    def sample_actions(
+    def _sample_actions_with_prefix(
         self,
         rng: at.KeyArrayLike,
         observation: _model.Observation,
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
-    ) -> _model.Actions:
+    ) -> tuple[_model.Actions, tuple, jax.Array]:
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
@@ -549,7 +548,19 @@ class Pi0(_model.BaseModel):
             return time >= -dt / 2
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
-        return x_0
+        return x_0, kv_cache, prefix_mask
+
+    @override
+    def sample_actions(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+    ) -> _model.Actions:
+        actions, _, _ = self._sample_actions_with_prefix(rng, observation, num_steps=num_steps, noise=noise)
+        return actions
 
     # ----------------------------------------------------------------------------------------------
     # flowpi πR² streaming runtime.
@@ -629,10 +640,11 @@ class Pi0(_model.BaseModel):
         # streams (reusing the same key would correlate the warm-start noise and the streaming
         # tail noise).
         sample_rng, renoise_rng = jax.random.split(rng)
-        clean = self.sample_actions(sample_rng, observation, num_steps=num_steps, noise=noise)
-
-        # Prefill the prefix KV cache (age 0).
-        kv_cache, prefix_mask = self._prefix_forward(observation)
+        # The standard denoising path already prefills the prefix. Reuse that completed KV cache
+        # for the streaming state instead of running the same VLM prefix a second time.
+        clean, kv_cache, prefix_mask = self._sample_actions_with_prefix(
+            sample_rng, observation, num_steps=num_steps, noise=noise
+        )
 
         eps = jax.random.normal(renoise_rng, clean.shape)
         tau = make_staircase_tau(horizon, d)[None, :].repeat(batch_size, axis=0)  # [B, H]

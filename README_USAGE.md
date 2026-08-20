@@ -21,7 +21,7 @@ All dependencies are installed in `.venv/` (JAX GPU, PyTorch cu126, Flax, lerobo
 ## 2. Dataset
 
 FlowPi uses LeRobot **v3.0** format (parquet with pixel-embedded images).
-A sample episode is at `test_data/adjust_bottle_ep0`.
+A sample episode is at `data/adjust_bottle_ep0`.
 
 For full training, replace `<dataset_path>` with your actual dataset path.
 
@@ -45,6 +45,8 @@ uv run python scripts/precompute_flow_cache.py \
   --num-workers 8
 ```
 
+`--max-frames` is a global smoke-run limit across the dataset, not a per-episode limit.
+
 Cache structure per episode:
 ```
 {flow_cache_dir}/
@@ -53,10 +55,11 @@ Cache structure per episode:
     left_wrist_0_rgb.npy
     right_wrist_0_rgb.npy
     valid.npy             # [T, K] bool (per-lag validity mask)
-  meta.json               # K, delta, resolution, ckpt hash for validation
+  meta.json               # K, delta, resolution, SEA-RAFT provenance for validation
 ```
 
 **IMPORTANT**: Changing `K` (num_flow_steps) or `Δ` (flow_stride_frames) requires recomputing the cache.
+Changing the SEA-RAFT checkpoint, variant, refinement iterations, or camera set also requires recomputing it.
 
 ## 4. Compute Normalization Stats
 
@@ -94,10 +97,8 @@ Key hyperparameters (configure via CLI overrides):
 | `model.flow.flow_stride_frames` | 3 | Δ: frames between flow pairs |
 | `optimizer.peak_lr` | 2.5e-5 | Learning rate |
 
-### Optional: Flow branch independent LR
-```bash
-uv run python scripts/train.py flowpi_aloha --optimizer-flow-lr 1e-4 ...
-```
+All trainable parameters currently use the same optimizer and learning rate. The old
+`--optimizer-flow-lr` example is not supported by the current training code.
 
 ## 6. Inference / Offline Replay
 
@@ -105,12 +106,14 @@ uv run python scripts/train.py flowpi_aloha --optimizer-flow-lr 1e-4 ...
 uv run python scripts/flowpi_infer.py \
   --config-name flowpi_aloha \
   --checkpoint /path/to/checkpoint \
-  --dataset test_data/adjust_bottle_ep0 \
+  --dataset data/adjust_bottle_ep0 \
   --slow-every-n 10 \
   --max-frames 100
 ```
 
-Output: `{checkpoint}/replay_actions.npz` with timing stats (RAFT/prefill/NFE).
+Replay accepts one or more contiguous LeRobot v3 episodes and automatically resets the
+streaming ring/prefix/action state at each `episode_index` boundary. Output is
+`{checkpoint}/replay_actions.npz` with timing stats (RAFT/prefill/NFE).
 
 ## 7. Running Tests
 

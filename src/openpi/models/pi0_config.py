@@ -136,14 +136,14 @@ class Pi0Config(_model.BaseModelConfig):
                 "max-autotune-no-cudagraphs",
             ]
         if self.flow is not None and self.flow.enabled:
-            assert self.flow.d_max < self.action_horizon / 2, (
-                f"flow.d_max ({self.flow.d_max}) must be < action_horizon/2 ({self.action_horizon / 2})"
-            )
+            assert (
+                self.flow.d_max < self.action_horizon / 2
+            ), f"flow.d_max ({self.flow.d_max}) must be < action_horizon/2 ({self.action_horizon / 2})"
             depth = _gemma.get_config(self.action_expert_variant).depth
             for layer in self.flow.injection_layers:
-                assert 0 <= layer < depth, (
-                    f"flow injection layer {layer} is out of range for action expert depth {depth}"
-                )
+                assert (
+                    0 <= layer < depth
+                ), f"flow injection layer {layer} is out of range for action expert depth {depth}"
 
     @property
     @override

@@ -338,6 +338,10 @@ class FlowPiRuntime:
         t0 = time.perf_counter()
         observation = _model.preprocess_observation(None, observation, train=False)
         kv_cache, prefix_mask = self.model._prefix_forward(observation)  # noqa: SLF001
+        # JAX dispatches device work asynchronously. Do not publish or record the prefill as
+        # complete until every cache and mask leaf is materialised; otherwise the slow worker can
+        # queue multiple VLM prefills on the device and under-report the service time.
+        jax.block_until_ready((kv_cache, prefix_mask))
         self.stats["prefill_ms"].append((time.perf_counter() - t0) * 1000)
         return kv_cache, prefix_mask
 

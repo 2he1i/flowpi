@@ -156,7 +156,7 @@ def create_torch_dataset(
             model_flow.num_flow_steps, model_flow.flow_stride_frames, model_flow.vlm_delay_max
         )
         for cam_key in dataset_camera_keys(repo_id):
-            delta_timestamps[cam_key] = [-o / fps for o in frame_offsets]
+            delta_timestamps[cam_key] = [o / fps for o in frame_offsets]
 
     dataset = make_lerobot_dataset(repo_id, delta_timestamps)
 

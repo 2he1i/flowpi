@@ -284,7 +284,21 @@ class Pi0(_model.BaseModel):
                     zero_time = nnx.swish(zero_time)
                     adarms_cond = jnp.concatenate([zero_time[:, None, :], adarms_cond], axis=1)  # [B, H+1, emb]
                 else:
-                    adarms_cond = jnp.concatenate([adarms_cond[:, None, :]] * 1, axis=1)  # [B, 1, emb] broadcastable
+                    zero_time = posemb_sincos(
+                        jnp.zeros((noisy_actions.shape[0],), dtype=jnp.float32),
+                        self.action_in_proj.out_features,
+                        min_period=4e-3,
+                        max_period=4.0,
+                    )
+                    zero_time = self.time_mlp_in(zero_time)
+                    zero_time = nnx.swish(zero_time)
+                    zero_time = self.time_mlp_out(zero_time)
+                    zero_time = nnx.swish(zero_time)
+                    action_cond = jnp.broadcast_to(
+                        adarms_cond[:, None, :],
+                        (noisy_actions.shape[0], noisy_actions.shape[1], adarms_cond.shape[-1]),
+                    )
+                    adarms_cond = jnp.concatenate([zero_time[:, None, :], action_cond], axis=1)  # [B, H+1, emb]
 
         tokens.append(action_expert_tokens)
         input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))

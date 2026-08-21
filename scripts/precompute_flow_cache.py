@@ -20,6 +20,7 @@ Usage:
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor
+import dataclasses
 import json
 import pathlib
 
@@ -54,6 +55,18 @@ def _cache_name(cam_key: str) -> str:
     """Cache file name for a camera: the dataset key with the 'observation.images.' prefix stripped,
     matching the post-repack camera names used by LoadFlowCache."""
     return cam_key.removeprefix("observation.images.")
+
+
+def _create_precompute_data_config(train_config):
+    """Create the data config without requiring a cache that this script is about to write."""
+    data_factory = train_config.data
+    flow_factory = getattr(data_factory, "flow", None)
+    if flow_factory is not None:
+        data_factory = dataclasses.replace(
+            data_factory,
+            flow=dataclasses.replace(flow_factory, load_flow_cache=False, sample_vlm_delay=False),
+        )
+    return data_factory.create(train_config.assets_dirs, train_config.model)
 
 
 def _process_episode(task: dict) -> dict:
@@ -146,7 +159,7 @@ def main():
     if model_flow is None or not model_flow.enabled:
         raise ValueError("Precomputing the flow cache requires a config with model.flow enabled.")
 
-    data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
+    data_config = _create_precompute_data_config(train_config)
     flow_cfg = data_config.flow
     if flow_cfg is None or not flow_cfg.enabled:
         raise ValueError("--data.flow.enabled must be true to precompute the flow cache.")

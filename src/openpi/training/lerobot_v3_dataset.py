@@ -27,6 +27,7 @@ mapping; `scripts/precompute_flow_cache.py` reuses `episode_frames()` instead of
 the episode-to-file-row relationship.
 """
 
+from collections import OrderedDict
 from collections.abc import Sequence
 import dataclasses
 import io
@@ -88,11 +89,21 @@ class _V3Meta:
 class LeRobotV3ParquetDataset:
     """Read-only LeRobot v3.0 dataset with `delta_timestamps` support."""
 
-    def __init__(self, root: str | pathlib.Path, delta_timestamps: dict[str, Sequence[float]] | None = None):
+    def __init__(
+        self,
+        root: str | pathlib.Path,
+        delta_timestamps: dict[str, Sequence[float]] | None = None,
+        *,
+        max_cached_files: int = 2,
+    ):
+        if max_cached_files <= 0:
+            raise ValueError(f"max_cached_files must be positive, got {max_cached_files}")
+
         self.root = pathlib.Path(root)
         self.meta = _V3Meta(self.root)
         self.delta_timestamps = {k: list(v) for k, v in (delta_timestamps or {}).items()}
         self._delta_indices = {k: [round(dt * self.meta.fps) for dt in v] for k, v in self.delta_timestamps.items()}
+        self._max_cached_files = max_cached_files
 
         self._episodes: list[_EpisodeEntry] = self._load_episodes()
         # Global (from, to) index range per episode, in the same order as `_episodes`.
@@ -103,8 +114,10 @@ class LeRobotV3ParquetDataset:
             start += ep.length
         self._num_frames = start
 
-        self._parquet_files: dict[tuple[int, int], pq.ParquetFile] = {}
-        self._tables: dict[tuple[int, int], pa.Table] = {}
+        # A table contains all embedded image bytes for its Parquet file. Keep this cache bounded:
+        # the full FlowPi dataset has thousands of files and an unbounded cache would eventually
+        # retain the entire dataset in every data-loader worker.
+        self._tables: OrderedDict[tuple[int, int], pa.Table] = OrderedDict()
         # Dataset global-index range [start, end) covered by each data parquet file.
         # `end` may be None until the file is opened (derived from the `index` column).
         self._file_bounds: dict[tuple[int, int], tuple[int, int | None]] = {}
@@ -177,14 +190,21 @@ class LeRobotV3ParquetDataset:
 
     def _parquet_table(self, chunk_index: int, file_index: int) -> pa.Table:
         key = (chunk_index, file_index)
-        if key not in self._tables:
-            path = self.root / "data" / f"chunk-{chunk_index:03d}" / f"file-{file_index:03d}.parquet"
-            pf = pq.ParquetFile(path)
-            self._parquet_files[key] = pf
-            table = pf.read()
-            self._tables[key] = table
-            self._file_bounds[key] = self._derive_file_bounds(key, table)
-        return self._tables[key]
+        table = self._tables.get(key)
+        if table is not None:
+            self._tables.move_to_end(key)
+            return table
+
+        path = self.root / "data" / f"chunk-{chunk_index:03d}" / f"file-{file_index:03d}.parquet"
+        table = pq.ParquetFile(path).read()
+        self._file_bounds[key] = self._derive_file_bounds(key, table)
+        self._tables[key] = table
+        self._tables.move_to_end(key)
+
+        while len(self._tables) > self._max_cached_files:
+            self._tables.popitem(last=False)
+
+        return table
 
     def _derive_file_bounds(self, key: tuple[int, int], table: pa.Table) -> tuple[int, int]:
         """Dataset global-index range [start, end) covered by a data parquet file.

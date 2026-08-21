@@ -1271,10 +1271,13 @@ _CONFIGS = [
         ),
         data=LeRobotAlohaDataConfig(
             repo_id="flowpi_data/train_dataset",
-            default_prompt="Adjust the bottle on the table",
+            # The converted FlowPi dataset is multi-task. Read the language instruction from
+            # meta/tasks.parquet instead of assigning one prompt to every episode.
+            base_config=DataConfig(prompt_from_task=True),
+            # All FlowPi variants share the stats computed in the adapted/delta action space.
             assets=AssetsConfig(
-                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
-                asset_id="trossen",
+                assets_dir="assets/flowpi_aloha",
+                asset_id="flowpi_data/train_dataset",
             ),
             repack_transforms=_transforms.Group(
                 inputs=[
@@ -1287,6 +1290,7 @@ _CONFIGS = [
                             },
                             "state": "observation.state",
                             "actions": "action",
+                            "prompt": "prompt",
                         }
                     )
                 ]

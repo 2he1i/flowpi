@@ -711,7 +711,7 @@ def _flowpi_ablation_configs() -> tuple[TrainConfig, ...]:
         data_flow = (
             FlowDataConfig(
                 mode="cache",
-                flow_cache_dir="<your-flow-cache-dir>",
+                flow_cache_dir="flowpi_data/flow_cache",
                 sea_raft_ckpt="<your-sea-raft-ckpt>",
                 sea_raft_device="cuda",
                 load_flow_cache=load_flow_cache,
@@ -724,7 +724,7 @@ def _flowpi_ablation_configs() -> tuple[TrainConfig, ...]:
             name=name,
             model=model,
             data=LeRobotAlohaDataConfig(
-                repo_id="<your-dataset>/adjust_bottle",
+                repo_id="flowpi_data/train_dataset",
                 default_prompt="Adjust the bottle on the table",
                 assets=AssetsConfig(
                     assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
@@ -1270,7 +1270,7 @@ _CONFIGS = [
             freeze_vision_encoder=True,
         ),
         data=LeRobotAlohaDataConfig(
-            repo_id="<your-dataset>/adjust_bottle",
+            repo_id="flowpi_data/train_dataset",
             default_prompt="Adjust the bottle on the table",
             assets=AssetsConfig(
                 assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
@@ -1293,7 +1293,7 @@ _CONFIGS = [
             ),
             flow=FlowDataConfig(
                 mode="cache",
-                flow_cache_dir="<your-flow-cache-dir>",
+                flow_cache_dir="flowpi_data/flow_cache",
                 sea_raft_ckpt="<your-sea-raft-ckpt>",
                 sea_raft_device="cuda",
             ),

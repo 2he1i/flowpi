@@ -35,7 +35,15 @@ online.
 ## 2. Dataset
 
 FlowPi uses LeRobot **v3.0** format (parquet with pixel-embedded images).
-A sample episode is at `data/adjust_bottle_ep0`.
+The repository-local `flowpi_data` entry points to `../../../data/flowpi_data` on the data disk,
+with separate locations for the training dataset and optical-flow cache:
+
+```
+flowpi_data/train_dataset/
+flowpi_data/flow_cache/
+```
+
+The existing local sample episode remains at `data/adjust_bottle_ep0`.
 
 For full training, replace `<dataset_path>` with your actual dataset path.
 
@@ -54,8 +62,8 @@ uv run python scripts/precompute_flow_cache.py \
 uv run python scripts/precompute_flow_cache.py \
   --config-name flowpi_aloha \
   --data.flow.sea-raft-ckpt /path/to/sea_raft_weights.pth \
-  --data.flow.flow_cache_dir /path/to/flow_cache \
-  --data.repo_id /path/to/dataset \
+  --data.flow.flow_cache_dir flowpi_data/flow_cache \
+  --data.repo_id flowpi_data/train_dataset \
   --num-workers 8
 ```
 
@@ -96,8 +104,8 @@ uv run python scripts/train.py debug_flowpi --exp_name smoke
 ```bash
 uv run python scripts/train.py flowpi_aloha \
   --exp_name my_run \
-  --data.repo_id /path/to/dataset \
-  --data.flow.flow_cache_dir /path/to/flow_cache \
+  --data.repo_id flowpi_data/train_dataset \
+  --data.flow.flow_cache_dir flowpi_data/flow_cache \
   --data.flow.sea-raft-ckpt /path/to/sea_raft_weights.pth
 ```
 
@@ -120,7 +128,7 @@ All trainable parameters currently use the same optimizer and learning rate. The
 uv run python scripts/flowpi_infer.py \
   --config-name flowpi_aloha \
   --checkpoint /path/to/checkpoint \
-  --dataset data/adjust_bottle_ep0 \
+  --dataset flowpi_data/train_dataset \
   --slow-every-n 10 \
   --max-frames 100
 ```

@@ -150,6 +150,47 @@ def _resolve_checkpoint_path(checkpoint_path: str) -> str:
     return str(path)
 
 
+def resolve_checkpoint_assets_dir(checkpoint_path: str | pathlib.Path) -> pathlib.Path | None:
+    """Find the local assets item belonging to a checkpoint path.
+
+    Training checkpoints are addressed in several ways by the inference tools: as a
+    checkpoint root, a numeric step directory, a latest symlink, or directly as
+    the params item. The assets live next to params in all of those layouts.
+    Return None for remote checkpoints or checkpoints without a local assets item
+    so callers can fall back to their configured assets source.
+    """
+    if str(checkpoint_path).startswith("gs://"):
+        return None
+
+    path = pathlib.Path(checkpoint_path).expanduser()
+    candidates: list[pathlib.Path] = []
+    if path.name == "params":
+        candidates.append(path.parent)
+    if (path / "params").is_dir():
+        candidates.append(path)
+    if (path / "assets").is_dir():
+        candidates.append(path)
+
+    latest = path / "latest"
+    if latest.is_symlink():
+        candidates.append(latest.resolve())
+
+    if path.is_dir():
+        candidates.extend(
+            sorted(
+                (directory for directory in path.iterdir() if directory.name.isdigit()),
+                key=lambda directory: int(directory.name),
+                reverse=True,
+            )
+        )
+
+    for candidate in candidates:
+        assets_dir = candidate / "assets"
+        if assets_dir.is_dir():
+            return assets_dir
+    return None
+
+
 def load_model_from_checkpoint(
     model_config: _model.BaseModelConfig,
     checkpoint_path: str,

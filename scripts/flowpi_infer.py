@@ -54,6 +54,31 @@ def _preserve_episode_index(group: _transforms.Group) -> _transforms.Group:
     raise ValueError("Replay requires a RepackTransform so it can detect episode boundaries.")
 
 
+def _create_inference_data_factory(train_config: _config.TrainConfig, checkpoint: str):
+    """Keep runtime settings while removing transforms that only belong to training.
+
+    A FlowPi training config normally uses LoadFlowCache and DelaySlowImage.
+    Neither should be constructed for replay: the runtime computes flow online and
+    tracks the slow-channel delay itself. Point the factory at the checkpoint assets
+    first so normalization uses the exact statistics saved with the trained weights.
+    """
+    data_factory = train_config.data
+    checkpoint_assets_dir = _checkpoints.resolve_checkpoint_assets_dir(checkpoint)
+    if checkpoint_assets_dir is not None:
+        data_factory = dataclasses.replace(
+            data_factory,
+            assets=dataclasses.replace(data_factory.assets, assets_dir=str(checkpoint_assets_dir)),
+        )
+
+    flow_factory = getattr(data_factory, "flow", None)
+    if flow_factory is not None:
+        data_factory = dataclasses.replace(
+            data_factory,
+            flow=dataclasses.replace(flow_factory, load_flow_cache=False, sample_vlm_delay=False),
+        )
+    return data_factory
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config-name", required=True, help="Training config name (e.g. flowpi_aloha)")
@@ -92,13 +117,17 @@ def main():
     if flow_cfg is None or not flow_cfg.enabled:
         raise ValueError("The model checkpoint must have flow enabled.")
 
-    # Full (flow-enabled) config: carries the SEA-RAFT checkpoint/device used at training time.
-    data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
+    # Keep the flow settings (SEA-RAFT checkpoint/device and model-derived geometry) for the
+    # runtime, but never construct training-only cache/delay transforms. The factory also points
+    # at checkpoint-local assets when available, making replay independent of the training assets
+    # location and ensuring normalization matches the restored weights.
+    inference_data_factory = _create_inference_data_factory(train_config, args.checkpoint)
+    data_config = inference_data_factory.create(train_config.assets_dirs, train_config.model)
 
     # Rebuild the data config with the flow pipeline disabled: the replay must feed the runtime
     # fresh current frames + state + prompt, and the runtime computes the flow and the slow delay
     # itself. Disabling flow also drops the camera history from the dataset (single-frame images).
-    runtime_data_config = dataclasses.replace(train_config.data, repo_id=args.dataset, flow=None).create(
+    runtime_data_config = dataclasses.replace(inference_data_factory, repo_id=args.dataset, flow=None).create(
         train_config.assets_dirs, train_config.model
     )
     # The runtime computes the SEA-RAFT flow on full-resolution frames; drop `ResizeImages` so

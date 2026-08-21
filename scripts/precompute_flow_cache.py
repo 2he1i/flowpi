@@ -1,8 +1,11 @@
 """Precompute the SEA-RAFT optical flow cache for a flowpi training config.
 
-For every episode, camera, frame t, and lag k = 1..K, computes `flow_8x = RAFT(I_{t-k*Δ}, I_t)`
-at 1/8 resolution and stores the *raw* flow as float16 (normalization is deferred to load time so
-that flow_scale / flow_clamp can be changed without recomputing the cache).
+For every episode, camera, target frame t, and lag k = 1..K, computes
+`flow_8x = RAFT(I_{t-k*Δ}, I_t)` at 1/8 resolution and stores the *raw* flow as float16
+(normalization is deferred to load time so that flow_scale / flow_clamp can be changed without
+recomputing the cache). Thus cache row `t` is always a flow observation whose target/source tick
+is `t`; training applies a channel age by loading row `t - d_flow` and leaves the K internal lags
+relative to that row unchanged.
 
 Output layout:
   {flow_cache_dir}/meta.json

@@ -48,6 +48,13 @@ class FlowConfig:
     # smoothing (0.8 * fitted + 0.2 * uniform) keeps a non-zero training mass on every delay so
     # the fast Action Expert never sees an out-of-distribution (rare but reachable) delay.
     vlm_delay_distribution: tuple[float, ...] | None = None
+    # Flow channel age. A small non-zero default models the likely 50 Hz / 20 Hz service-rate
+    # mismatch while keeping the support narrow. Set to 0 for the exact synchronous regression
+    # path. This is independent from the VLM delay above.
+    flow_delay_max: int = 2
+    # Optional training-time sampling distribution for flow age over [0, flow_delay_max].
+    # Weights are normalized over delays reachable at the current episode tick.
+    flow_delay_distribution: tuple[float, ...] | None = None
     # Ablation toggles. These gate the *use* of a channel in the forward pass but never the
     # parameter layout: the flow modules are always created when `enabled`, so every flowpi
     # configuration (including ablations) shares one architecture and can load the same
@@ -105,6 +112,23 @@ class FlowConfig:
             if sum(self.vlm_delay_distribution) <= 0:
                 raise ValueError(
                     f"vlm_delay_distribution must have at least one positive weight, got {self.vlm_delay_distribution}"
+                )
+        if self.flow_delay_max < 0:
+            raise ValueError(f"flow_delay_max must be non-negative, got {self.flow_delay_max}")
+        if self.flow_delay_distribution is not None:
+            if len(self.flow_delay_distribution) != self.flow_delay_max + 1:
+                raise ValueError(
+                    f"flow_delay_distribution must have flow_delay_max+1={self.flow_delay_max + 1} weights "
+                    f"(one per delay in [0, flow_delay_max]), got {len(self.flow_delay_distribution)}"
+                )
+            if any(p < 0 for p in self.flow_delay_distribution):
+                raise ValueError(
+                    f"flow_delay_distribution weights must be non-negative, got {self.flow_delay_distribution}"
+                )
+            if sum(self.flow_delay_distribution) <= 0:
+                raise ValueError(
+                    "flow_delay_distribution must have at least one positive weight, "
+                    f"got {self.flow_delay_distribution}"
                 )
         if self.num_cross_heads <= 0:
             raise ValueError(f"num_cross_heads must be positive, got {self.num_cross_heads}")
@@ -165,14 +189,14 @@ class Pi0Config(_model.BaseModelConfig):
                 "max-autotune-no-cudagraphs",
             ]
         if self.flow is not None and self.flow.enabled:
-            assert (
-                self.flow.d_max < self.action_horizon / 2
-            ), f"flow.d_max ({self.flow.d_max}) must be < action_horizon/2 ({self.action_horizon / 2})"
+            assert self.flow.d_max < self.action_horizon / 2, (
+                f"flow.d_max ({self.flow.d_max}) must be < action_horizon/2 ({self.action_horizon / 2})"
+            )
             depth = _gemma.get_config(self.action_expert_variant).depth
             for layer in self.flow.injection_layers:
-                assert (
-                    0 <= layer < depth
-                ), f"flow injection layer {layer} is out of range for action expert depth {depth}"
+                assert 0 <= layer < depth, (
+                    f"flow injection layer {layer} is out of range for action expert depth {depth}"
+                )
 
     @property
     @override
@@ -229,6 +253,9 @@ class Pi0Config(_model.BaseModelConfig):
                     jax.ShapeDtypeStruct([batch_size], jnp.int32)
                     if flow is not None and flow.enabled and flow.vlm_delay_max > 0
                     else None
+                ),
+                flow_delay=(
+                    jax.ShapeDtypeStruct([batch_size], jnp.int32) if flow is not None and flow.enabled else None
                 ),
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)

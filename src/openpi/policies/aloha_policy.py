@@ -89,7 +89,7 @@ class AlohaInputs(transforms.DataTransformFn):
                     inputs["flow"][dest] = data["flow"][source]
                     inputs["flow_masks"][dest] = data["flow_masks"][source]
 
-        for key in ("vlm_delay", "episode_index", "frame_index"):
+        for key in ("vlm_delay", "flow_delay", "episode_index", "frame_index"):
             if key in data:
                 inputs[key] = data[key]
 

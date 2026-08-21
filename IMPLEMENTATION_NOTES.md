@@ -68,6 +68,39 @@
 - `flowpi_plan/README_USAGE.md`: complete usage guide
 - `flowpi_plan/IMPLEMENTATION_NOTES.md`: this document
 
+## M7 — Three-channel training freshness
+
+FlowPI training now uses the same freshness contract as the intended asynchronous runtime:
+
+```text
+Fast channel:
+    state[t] and actions[t:] at the current dataset/control tick
+
+Flow channel:
+    cached or online flow targeted at s = t - flow_delay
+    flow[s] still contains F_(s-k*stride -> s) for each internal lag k
+    flow_delay is sampled independently from vlm_delay
+
+Slow channel:
+    VLM image/prefix observation[t-vlm_delay]
+    vlm_delay is sampled independently from flow_delay
+```
+
+`FlowConfig.flow_delay_max` and `flow_delay_distribution` mirror the existing VLM delay
+interface. Delay support is clamped and renormalized at episode start, so neither channel can
+read across an episode boundary. `Observation` carries both ages, and the flow tokenizer adds a
+normally initialized global flow-age embedding in addition to its existing internal lag
+embedding. The Flow cross-attention gate remains zero-initialized.
+
+The precomputed cache has a strict row convention: cache row `s` is SEA-RAFT flow ending at
+episode tick `s`. Training simulates asynchronous channel freshness by selecting historical
+cached observations; future online runtime will replace this sampling with actual worker
+completion timestamps while preserving exactly the same model input semantics.
+
+Training keeps the dataset/control tick at the dataset FPS (V1: 50 Hz). The online runtime still
+publishes the synchronous flow observation with `flow_delay=0`, but its telemetry now exposes the
+future contract fields `flow_source_tick`, `flow_delay_ticks`, and `flow_delay_ms`.
+
 ## Review Fixes (GPT-review pass, main branch)
 
 ### P0 — Offline cache correctness

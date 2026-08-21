@@ -134,6 +134,7 @@ class Pi0(_model.BaseModel):
             h, w = flow_cfg.flow_image_size[0] // 8, flow_cfg.flow_image_size[1] // 8
             self.flow_tokenizer = _flow_tokenizer.FlowTokenizer(
                 num_flow_steps=flow_cfg.num_flow_steps,
+                flow_delay_max=flow_cfg.flow_delay_max,
                 flow_grid_size=(h, w),
                 width=action_expert_config.width,
                 channels=flow_cfg.tokenizer_channels,
@@ -321,7 +322,11 @@ class Pi0(_model.BaseModel):
         exactly zero (identity) instead of injecting learned attention over a dummy token."""
         if self.flow_config is None or not self.flow_config.use_flow or obs.flow is None:
             return None
-        return self.flow_tokenizer(obs.flow, obs.flow_masks or dict.fromkeys(obs.flow))
+        return self.flow_tokenizer(
+            obs.flow,
+            obs.flow_masks or dict.fromkeys(obs.flow),
+            obs.flow_delay,
+        )
 
     @override
     def compute_loss(
@@ -431,12 +436,28 @@ class Pi0(_model.BaseModel):
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
         sq = jnp.square(v_t - u_t)
+        flow_delay_metrics = {}
+        if self.flow_config is not None:
+            # Missing flow_delay is the backwards-compatible synchronous value d_flow=0.
+            flow_delay = (
+                jnp.zeros(observation.state.shape[:-1], dtype=jnp.float32)
+                if observation.flow_delay is None
+                else jnp.asarray(observation.flow_delay, dtype=jnp.float32)
+            )
+            flow_delay = jnp.clip(flow_delay, 0, self.flow_config.flow_delay_max)
+            flow_delay_metrics = {
+                "mean_flow_delay": jnp.mean(flow_delay),
+                "frac_flow_delay_0": jnp.mean((flow_delay == 0).astype(jnp.float32)),
+            }
         if self.flow_config is not None and self.pi05 and self.flow_config.use_pir2:
             # Renormalize valid positions so the outer mean matches the baseline π0.5 loss scale.
             valid_count = jnp.maximum(jnp.sum(loss_mask, axis=-1, keepdims=True), 1.0)
             loss = jnp.mean(sq, axis=-1) * loss_mask * (horizon / valid_count)
-            return loss, self._flow_loss_metrics(loss, sq, is_pir2, tau, loss_mask, flow_stats)
-        return jnp.mean(sq, axis=-1), {}
+            return loss, {
+                **self._flow_loss_metrics(loss, sq, is_pir2, tau, loss_mask, flow_stats),
+                **flow_delay_metrics,
+            }
+        return jnp.mean(sq, axis=-1), flow_delay_metrics
 
     def _flow_loss_metrics(
         self,

@@ -152,8 +152,12 @@ def create_torch_dataset(
         if model_flow is None or not model_flow.enabled:
             raise ValueError("data.flow.enabled requires model.flow to be enabled.")
         fps = dataset_fps(repo_id)
+        flow_delay_max = model_flow.flow_delay_max if flow.load_flow_cache else 0
         frame_offsets = _transforms.compute_image_frame_offsets(
-            model_flow.num_flow_steps, model_flow.flow_stride_frames, model_flow.vlm_delay_max
+            model_flow.num_flow_steps,
+            model_flow.flow_stride_frames,
+            model_flow.vlm_delay_max,
+            flow_delay_max,
         )
         for cam_key in dataset_camera_keys(repo_id):
             delta_timestamps[cam_key] = [o / fps for o in frame_offsets]

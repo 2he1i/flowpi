@@ -344,17 +344,29 @@ class PadStatesAndActions(DataTransformFn):
 # --------------------------------------------------------------------------------------------------
 
 
-def compute_image_frame_offsets(num_flow_steps: int, flow_stride_frames: int, vlm_delay_max: int) -> tuple[int, ...]:
-    """Computes the set of *negative* frame offsets (into the past) that must be loaded for the image
-    keys: one frame per flow lag (`k * flow_stride_frames` for `k = 1..num_flow_steps`) plus the slow
-    channel delay window (`1..vlm_delay_max`), always including the current frame (offset 0).
+def compute_image_frame_offsets(
+    num_flow_steps: int,
+    flow_stride_frames: int,
+    vlm_delay_max: int,
+    flow_delay_max: int = 0,
+) -> tuple[int, ...]:
+    """Computes the negative frame offsets needed by both asynchronous channels.
 
-    Returned in ascending (oldest-first) order, matching the `delta_timestamps` convention
-    `[(-i) / fps for i in vlm_delay_max..0]`.
+    For a current action tick ``t``, the VLM may read ``t - d_vlm`` and a flow observation with
+    age ``d_flow`` needs the target frame ``t - d_flow`` plus its internal history
+    ``t - d_flow - k * flow_stride_frames``.  ``flow_delay_max=0`` preserves the original
+    FlowPI offsets and therefore the d_flow=0 data path.
+
+    Returned offsets are ascending (oldest-first), matching the ``delta_timestamps`` convention.
     """
     offsets = {0}
-    offsets.update(k * flow_stride_frames for k in range(1, num_flow_steps + 1))
     offsets.update(range(1, vlm_delay_max + 1))
+    offsets.update(range(flow_delay_max + 1))
+    offsets.update(
+        flow_delay + k * flow_stride_frames
+        for flow_delay in range(flow_delay_max + 1)
+        for k in range(1, num_flow_steps + 1)
+    )
     return tuple(-o for o in sorted(offsets, reverse=True))
 
 
@@ -368,6 +380,62 @@ def normalize_flow(flow: np.ndarray, flow_scale: float, flow_clamp: float) -> np
     return np.clip(flow.astype(np.float32) / flow_scale, -flow_clamp, flow_clamp)
 
 
+def _delay_rng(seed: int, worker_id: int, call_index: int, stream_id: int) -> np.random.Generator:
+    """Returns a worker-safe RNG whose stream is distinct for each asynchronous channel."""
+    # Keep the existing VLM stream byte-for-byte compatible (stream 0 used
+    # ``[seed, worker_id, call_index]`` before flow age was added). Flow uses a domain-separated
+    # stream so the two channels never draw the same categorical sequence by construction.
+    entropy = [seed, worker_id, call_index] if stream_id == 0 else [seed, stream_id, worker_id, call_index]
+    return np.random.default_rng(np.random.SeedSequence(entropy))
+
+
+def _worker_id() -> int:
+    try:
+        import torch
+
+        worker_info = torch.utils.data.get_worker_info()
+        return 0 if worker_info is None else worker_info.id
+    except ImportError:
+        return 0
+
+
+def _sample_reachable_delay(
+    rng: np.random.Generator,
+    frame_index: int,
+    delay_max: int,
+    distribution: np.ndarray | None,
+) -> int:
+    """Samples a delay after restricting its support to frames in the current episode."""
+    max_delay = min(delay_max, max(frame_index, 0))
+    if distribution is None:
+        return int(rng.integers(0, max_delay + 1))
+
+    reachable = distribution[: max_delay + 1]
+    total = reachable.sum()
+    if total <= 0:
+        return int(rng.integers(0, max_delay + 1))
+    return int(rng.choice(max_delay + 1, p=reachable / total))
+
+
+def _resolve_delay(
+    data: DataDict,
+    key: str,
+    *,
+    frame_index: int,
+    delay_max: int,
+    distribution: np.ndarray | None,
+    rng: np.random.Generator,
+) -> int:
+    """Reads or samples a channel age and clamps it to the episode-reachable support."""
+    if key in data:
+        requested = int(np.asarray(data[key]).item())
+        delay = min(max(requested, 0), delay_max, max(frame_index, 0))
+    else:
+        delay = _sample_reachable_delay(rng, frame_index, delay_max, distribution)
+    data[key] = delay
+    return delay
+
+
 class LoadFlowCache(DataTransformFn):
     """Loads precomputed raw SEA-RAFT flow from the offline cache (training path).
 
@@ -378,6 +446,9 @@ class LoadFlowCache(DataTransformFn):
 
     Produces `data["flow"] = {cam_key: [K, 2, h, w]}` (normalized) and
     `data["flow_masks"] = {cam_key: [K]}` (per-lag validity).
+
+    For action tick ``t``, ``flow_delay=d`` selects cache row ``s=t-d``. That row remains the
+    complete observation targeted at ``s``: its K entries are ``F_(s-k*stride -> s)``.
 
     Flow arrays are memory-mapped (never loaded whole into RAM); the open per-episode mappings
     are bounded by an LRU so that long/many-episode datasets cannot exhaust file descriptors.
@@ -393,6 +464,9 @@ class LoadFlowCache(DataTransformFn):
         flow_image_size: tuple[int, int],
         flow_scale: float,
         flow_clamp: float,
+        flow_delay_max: int = 0,
+        flow_delay_distribution: Sequence[float] | None = None,
+        seed: int = 1,
         sea_raft_ckpt: str | pathlib.Path | None = None,
         sea_raft_variant: str | None = None,
         sea_raft_iters: int | None = None,
@@ -405,6 +479,25 @@ class LoadFlowCache(DataTransformFn):
         self.flow_image_size = tuple(flow_image_size)
         self.flow_scale = flow_scale
         self.flow_clamp = flow_clamp
+        self.flow_delay_max = flow_delay_max
+        self.flow_delay_distribution = (
+            None if flow_delay_distribution is None else np.asarray(list(flow_delay_distribution), dtype=np.float64)
+        )
+        if self.flow_delay_max < 0:
+            raise ValueError(f"flow_delay_max must be non-negative, got {self.flow_delay_max}")
+        if self.flow_delay_distribution is not None:
+            if len(self.flow_delay_distribution) != self.flow_delay_max + 1:
+                raise ValueError(
+                    f"flow delay distribution must have flow_delay_max+1={self.flow_delay_max + 1} weights "
+                    f"(one per delay in [0, flow_delay_max]), got {len(self.flow_delay_distribution)}"
+                )
+            if np.any(self.flow_delay_distribution < 0) or self.flow_delay_distribution.sum() <= 0:
+                raise ValueError(
+                    "flow delay distribution weights must be non-negative with a positive sum, "
+                    f"got {self.flow_delay_distribution}"
+                )
+        self.seed = seed
+        self._calls = 0
         self.sea_raft_ckpt = str(sea_raft_ckpt) if sea_raft_ckpt else None
         self.sea_raft_variant = sea_raft_variant
         self.sea_raft_iters = sea_raft_iters
@@ -485,15 +578,33 @@ class LoadFlowCache(DataTransformFn):
     def __call__(self, data: DataDict) -> DataDict:
         episode_index = int(np.asarray(data["episode_index"]).item())
         frame_index = int(np.asarray(data["frame_index"]).item())
+        flow_delay = _resolve_delay(
+            data,
+            "flow_delay",
+            frame_index=frame_index,
+            delay_max=self.flow_delay_max,
+            distribution=self.flow_delay_distribution,
+            rng=_delay_rng(self.seed, _worker_id(), self._calls, stream_id=1),
+        )
+        self._calls += 1
+        source_frame_index = frame_index - flow_delay
         flows, valid = self._episode(episode_index)
 
         data["flow"] = {}
         data["flow_masks"] = {}
         for cam in self.cam_keys:
-            raw = np.asarray(flows[cam][frame_index], dtype=np.float32)  # [K, 2, h, w]
+            if not 0 <= source_frame_index < flows[cam].shape[0]:
+                raise IndexError(
+                    f"Flow source tick {source_frame_index} is outside episode {episode_index} "
+                    f"cache range [0, {flows[cam].shape[0]})."
+                )
+            # Cache row s is the flow whose target/current frame is episode tick s.  Selecting
+            # row t-d_flow makes the channel age real; the K lag entries inside that row are
+            # still F_(s-k*stride -> s), never reinterpreted around t.
+            raw = np.asarray(flows[cam][source_frame_index], dtype=np.float32)  # [K, 2, h, w]
             if raw.shape[0] != self.num_flow_steps:
                 raise ValueError(f"Flow cache for {cam} has {raw.shape[0]} lags, expected {self.num_flow_steps}")
-            lag_valid = valid[frame_index].astype(bool)  # [K]
+            lag_valid = valid[source_frame_index].astype(bool)  # [K]
             flow = normalize_flow(raw, self.flow_scale, self.flow_clamp)
             flow = flow * lag_valid[:, None, None, None]
             data["flow"][cam] = flow
@@ -505,8 +616,9 @@ class ComputeFlow(DataTransformFn):
     """Computes SEA-RAFT flow online from stacked camera history (inference / cache precomputation path).
 
     Expects `data["images"][cam_key]` to be a stacked `[T, 3, H, W]` uint8 array ordered like
-    `frame_offsets` (oldest first, current frame at `frame_offset_index(frame_offsets, 0)`).
-    Produces the same `data["flow"]` / `data["flow_masks"]` structure as `LoadFlowCache`.
+    `frame_offsets` (oldest first). For action tick ``t``, ``flow_delay=d`` targets the image at
+    offset ``-d`` and computes each internal lag from ``-(d + k * flow_stride_frames)`` to that
+    target. Produces the same `data["flow"]` / `data["flow_masks"]` structure as `LoadFlowCache`.
     """
 
     def __init__(
@@ -519,6 +631,9 @@ class ComputeFlow(DataTransformFn):
         flow_scale: float,
         flow_clamp: float,
         frame_offsets: tuple[int, ...],
+        flow_delay_max: int = 0,
+        flow_delay_distribution: Sequence[float] | None = None,
+        seed: int = 1,
     ):
         self.extractor = extractor
         self.cam_keys = tuple(cam_keys)
@@ -527,21 +642,50 @@ class ComputeFlow(DataTransformFn):
         self.flow_scale = flow_scale
         self.flow_clamp = flow_clamp
         self.frame_offsets = tuple(frame_offsets)
+        self.flow_delay_max = flow_delay_max
+        self.flow_delay_distribution = (
+            None if flow_delay_distribution is None else np.asarray(list(flow_delay_distribution), dtype=np.float64)
+        )
+        if self.flow_delay_max < 0:
+            raise ValueError(f"flow_delay_max must be non-negative, got {self.flow_delay_max}")
+        if self.flow_delay_distribution is not None:
+            if len(self.flow_delay_distribution) != self.flow_delay_max + 1:
+                raise ValueError(
+                    f"flow delay distribution must have flow_delay_max+1={self.flow_delay_max + 1} weights "
+                    f"(one per delay in [0, flow_delay_max]), got {len(self.flow_delay_distribution)}"
+                )
+            if np.any(self.flow_delay_distribution < 0) or self.flow_delay_distribution.sum() <= 0:
+                raise ValueError(
+                    "flow delay distribution weights must be non-negative with a positive sum, "
+                    f"got {self.flow_delay_distribution}"
+                )
+        self.seed = seed
+        self._calls = 0
 
     def __call__(self, data: DataDict) -> DataDict:
         frame_index = int(np.asarray(data["frame_index"]).item())
-        curr_idx = frame_offset_index(self.frame_offsets, 0)
+        flow_delay = _resolve_delay(
+            data,
+            "flow_delay",
+            frame_index=frame_index,
+            delay_max=self.flow_delay_max,
+            distribution=self.flow_delay_distribution,
+            rng=_delay_rng(self.seed, _worker_id(), self._calls, stream_id=1),
+        )
+        self._calls += 1
+        curr_idx = frame_offset_index(self.frame_offsets, -flow_delay)
 
         prev_frames = []
         curr_frames = []
         lag_valid = np.ones(self.num_flow_steps, dtype=bool)
         for k in range(1, self.num_flow_steps + 1):
-            lag_idx = frame_offset_index(self.frame_offsets, -k * self.flow_stride_frames)
+            lag_offset = flow_delay + k * self.flow_stride_frames
+            lag_idx = frame_offset_index(self.frame_offsets, -lag_offset)
             for cam in self.cam_keys:
                 stack = np.asarray(data["images"][cam])
                 prev_frames.append(stack[lag_idx])
                 curr_frames.append(stack[curr_idx])
-            lag_valid[k - 1] = frame_index >= k * self.flow_stride_frames
+            lag_valid[k - 1] = frame_index - flow_delay >= k * self.flow_stride_frames
 
         prev = np.stack(prev_frames, axis=0)[None]  # [1, K*n_cam, 3, H, W]
         curr = np.stack(curr_frames, axis=0)[None]
@@ -609,27 +753,9 @@ class DelaySlowImage(DataTransformFn):
             return data
 
         frame_index = int(np.asarray(data["frame_index"]).item())
-        max_d = min(self.vlm_delay_max, max(frame_index, 0))
-        worker_id = 0
-        try:
-            import torch
-
-            worker_info = torch.utils.data.get_worker_info()
-            worker_id = worker_info.id if worker_info is not None else 0
-        except ImportError:
-            pass
-        rng = np.random.default_rng(np.random.SeedSequence([self.seed, worker_id, self._calls]))
+        rng = _delay_rng(self.seed, _worker_id(), self._calls, stream_id=0)
         self._calls += 1
-        if self.distribution is None:
-            d_vlm = int(rng.integers(0, max_d + 1))
-        else:
-            # Categorical sampling from the fitted histogram, renormalized over the delays actually
-            # reachable at this frame (early in an episode the delay can never exceed frame_index,
-            # matching the runtime's clamping). If the fitted mass lies entirely beyond the
-            # reachable range, fall back to uniform over the reachable delays.
-            p = self.distribution[: max_d + 1]
-            total = p.sum()
-            d_vlm = int(rng.choice(max_d + 1, p=p / total)) if total > 0 else int(rng.integers(0, max_d + 1))
+        d_vlm = _sample_reachable_delay(rng, frame_index, self.vlm_delay_max, self.distribution)
 
         idx = frame_offset_index(self.frame_offsets, -d_vlm) if d_vlm > 0 else frame_offset_index(self.frame_offsets, 0)
         data["images"] = {cam: np.asarray(stack)[idx] for cam, stack in images.items()}

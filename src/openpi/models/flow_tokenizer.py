@@ -1,8 +1,9 @@
-"""flowpi Flow Tokenizer: CNN + positional/lag/camera embeddings -> per-camera flow tokens.
+"""flowpi Flow Tokenizer: CNN + positional/lag/camera/age embeddings -> flow tokens.
 
-Consumes `obs.flow` (normalized, per camera `[B, K, 2, H//8, W//8]`) and `obs.flow_masks`
-(per-lag validity `[B, K]`), and produces a single token sequence `[B, n_cam*K*grid, D]` for the
-gated flow cross-attention inside the action expert.
+Consumes `obs.flow` (normalized, per camera `[B, K, 2, H//8, W//8]`), `obs.flow_masks`
+(per-lag validity `[B, K]`), and the global flow-channel age `obs.flow_delay`. It produces a
+single token sequence `[B, n_cam*K*grid, D]` for the gated flow cross-attention inside the action
+expert. The learned global age embedding is separate from the internal per-lag embedding.
 
 All parameters are normally initialized (no zero-init here). The cross-attention gates in
 gemma.Module are zero-initialized: at initialization tanh(gate) = 0 zeroes the whole flow
@@ -35,6 +36,7 @@ class FlowTokenizer(nnx.Module):
         self,
         *,
         num_flow_steps: int,
+        flow_delay_max: int,
         flow_grid_size: tuple[int, int],  # (H//8, W//8)
         width: int,  # action expert width (output dim)
         channels: tuple[int, ...] = (32, 64, 128),
@@ -42,6 +44,7 @@ class FlowTokenizer(nnx.Module):
         rngs: nnx.Rngs,
     ):
         self.num_flow_steps = num_flow_steps
+        self.flow_delay_max = flow_delay_max
         self.flow_grid_size = tuple(flow_grid_size)
         self.width = width
 
@@ -96,6 +99,14 @@ class FlowTokenizer(nnx.Module):
             embedding_init=_normal_small,
             rngs=rngs,
         )
+        # Global age of the complete flow observation. This is deliberately distinct from
+        # lag_emb, which identifies the K temporal offsets inside one cached observation.
+        self.flow_delay_emb = nnx.Embed(
+            num_embeddings=flow_delay_max + 1,
+            features=hidden,
+            embedding_init=_normal_small,
+            rngs=rngs,
+        )
 
     def _pos_emb(self) -> jax.Array:
         """Fixed 2D sincos positional embedding [gh, gw, hidden]."""
@@ -126,7 +137,9 @@ class FlowTokenizer(nnx.Module):
         x = x + self._pos_emb().reshape(gh * gw, -1)
         return x.reshape(b, k * gh * gw, -1)
 
-    def __call__(self, flow: dict, flow_masks: dict) -> tuple[jax.Array, jax.Array]:
+    def __call__(
+        self, flow: dict, flow_masks: dict, flow_delay: jax.Array | None = None
+    ) -> tuple[jax.Array, jax.Array]:
         """Returns (tokens [B, n_cam*K*gh*gw, width], token_mask [B, n_cam*K*gh*gw])."""
         token_lists = []
         mask_lists = []
@@ -153,6 +166,11 @@ class FlowTokenizer(nnx.Module):
 
         tokens = jnp.concatenate(token_lists, axis=1)  # [B, F, hidden]
         token_mask = jnp.concatenate(mask_lists, axis=1)  # [B, F]
+
+        if flow_delay is None:
+            flow_delay = jnp.zeros((tokens.shape[0],), dtype=jnp.int32)
+        flow_delay = jnp.clip(jnp.asarray(flow_delay, dtype=jnp.int32), 0, self.flow_delay_max)
+        tokens = tokens + self.flow_delay_emb(flow_delay)[:, None, :]
 
         tokens = self.norm(tokens)
         tokens = nnx.silu(self.mlp_in(tokens))

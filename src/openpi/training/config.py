@@ -65,9 +65,11 @@ class AssetsConfig:
 class FlowDataConfig:
     """Data-pipeline configuration for the flow fast-path.
 
-    K / Δ / vlm_delay_max / flow scale / clamp are read from `model.flow` (single source of truth).
+    K / Δ / vlm_delay_max / flow_delay_max / flow scale / clamp are read from `model.flow`
+    (single source of truth).
 
-    The two toggles decouple *loading the flow cache* from *simulating the VLM delay* so the
+    Flow age is sampled from `model.flow.flow_delay_distribution` independently from the VLM
+    age. The two toggles decouple *loading the flow cache* from *simulating the VLM delay* so the
     ablation configs stay clean cumulative ablations:
       - ``load_flow_cache=False``  -> no flow transform, no camera history
       - ``sample_vlm_delay=False`` -> no DelaySlowImage (the VLM image is the current frame)
@@ -317,8 +319,14 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
                 raise ValueError("--data.flow.enabled requires the model config to have flow enabled (model.flow).")
             flow_config = self.flow
             cam_keys = self._repack_image_keys(repack_transforms)
+            # Flow history is needed only when the flow channel is loaded. VLM-only ablations
+            # retain the smaller history window used by DelaySlowImage.
+            flow_delay_max = model_flow.flow_delay_max if self.flow.load_flow_cache else 0
             frame_offsets = _transforms.compute_image_frame_offsets(
-                model_flow.num_flow_steps, model_flow.flow_stride_frames, model_flow.vlm_delay_max
+                model_flow.num_flow_steps,
+                model_flow.flow_stride_frames,
+                model_flow.vlm_delay_max,
+                flow_delay_max,
             )
             flow_transforms: list[_transforms.DataTransformFn] = []
             if self.flow.load_flow_cache:
@@ -341,6 +349,9 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
                             flow_scale=model_flow.flow_scale,
                             flow_clamp=model_flow.flow_clamp,
                             frame_offsets=frame_offsets,
+                            flow_delay_max=model_flow.flow_delay_max,
+                            flow_delay_distribution=model_flow.flow_delay_distribution,
+                            seed=1,
                         )
                     )
                 else:
@@ -355,6 +366,9 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
                             flow_image_size=model_flow.flow_image_size,
                             flow_scale=model_flow.flow_scale,
                             flow_clamp=model_flow.flow_clamp,
+                            flow_delay_max=model_flow.flow_delay_max,
+                            flow_delay_distribution=model_flow.flow_delay_distribution,
+                            seed=1,
                             sea_raft_ckpt=self.flow.sea_raft_ckpt,
                             sea_raft_variant=self.flow.sea_raft_variant,
                             sea_raft_iters=self.flow.sea_raft_iters,

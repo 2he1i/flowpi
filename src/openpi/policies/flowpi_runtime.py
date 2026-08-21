@@ -189,8 +189,22 @@ class FlowPiRuntime:
         # Frame ring buffer geometry.
         k = flow_config.num_flow_steps
         stride = flow_config.flow_stride_frames
-        self._ring_capacity = k * stride + 1
-        self._frame_offsets = compute_image_frame_offsets(k, stride, flow_config.vlm_delay_max)
+        # Keep enough history for the future mailbox-based flow worker contract as well as the
+        # current synchronous d_flow=0 implementation. The runtime currently publishes the
+        # flow ending at the current tick, so its observed flow age remains exactly zero.
+        self._ring_capacity = (
+            max(
+                k * stride + flow_config.flow_delay_max,
+                flow_config.vlm_delay_max,
+            )
+            + 1
+        )
+        self._frame_offsets = compute_image_frame_offsets(
+            k,
+            stride,
+            flow_config.vlm_delay_max,
+            flow_config.flow_delay_max,
+        )
 
         # SEA-RAFT extractor (online flow).
         self._raft = SeaRaftFlowExtractor(
@@ -244,6 +258,7 @@ class FlowPiRuntime:
         # Telemetry (wall-clock ms and delays; appended from the main thread and the slow worker).
         self.stats: dict[str, list[float]] = {
             "flow_ms": [],
+            "flow_compute_ms": [],
             "prefill_ms": [],
             "tick_total_ms": [],
             "tick_wall_ms": [],
@@ -315,7 +330,9 @@ class FlowPiRuntime:
 
         raft_t0 = time.perf_counter()
         flow = self._raft.compute(prev_stacked, curr_stacked)  # [1, K*n_cam, 2, h8, w8]
-        self.stats["flow_ms"].append((time.perf_counter() - raft_t0) * 1000)
+        flow_ms = (time.perf_counter() - raft_t0) * 1000
+        self.stats["flow_ms"].append(flow_ms)
+        self.stats["flow_compute_ms"].append(flow_ms)
         _, _, _, h8, w8 = flow.shape
         if (h8, w8) != self._flow_grid:
             raise ValueError(
@@ -471,15 +488,21 @@ class FlowPiRuntime:
             observation,
             flow={cam: jnp.asarray(arr)[None, ...] for cam, arr in flow_data.items()},
             flow_masks={cam: jnp.asarray(mask)[None, ...] for cam, mask in flow_masks.items()},
+            flow_delay=jnp.zeros((observation.state.shape[0],), dtype=jnp.int32),
             vlm_delay=jnp.full((observation.state.shape[0],), delay, dtype=jnp.int32),
         )
 
-        # Per-tick freshness telemetry: reconstructs Age_VLM (current - prefix_source_tick),
-        # Age_Flow (always 0 here: flow is recomputed per tick) and the raw tick numbers.
+        # Per-tick freshness telemetry: reconstructs Age_VLM (current - prefix_source_tick) and
+        # the current synchronous flow worker contract (Age_Flow=0). An asynchronous worker can
+        # replace these three flow fields without changing the model Observation API.
+        flow_compute_ms = self.stats["flow_compute_ms"][-1]
         self.telemetry.append(
             {
                 "tick": self._frame_index,
                 "flow_source_tick": self._frame_index,
+                "flow_delay_ticks": 0,
+                "flow_delay_ms": 0.0,
+                "flow_compute_ms": flow_compute_ms,
                 "prefix_source_tick": self._prefix_source_tick or 0,
                 "delay_ticks": delay,
                 "delay_ticks_raw": delay_raw,

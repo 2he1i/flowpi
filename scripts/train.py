@@ -149,6 +149,9 @@ def _flow_param_metrics(config: _config.TrainConfig, params: nnx.State) -> dict[
     delay_emb = jax.tree.leaves(params.filter(nnx_utils.PathRegex(".*flow_vlm_delay_fast.*embedding.*")))
     if delay_emb:
         metrics["flow_delay_emb_norm"] = jnp.sqrt(jnp.mean(jnp.square(delay_emb[0].astype(jnp.float32))))
+    flow_age_emb = jax.tree.leaves(params.filter(nnx_utils.PathRegex(".*flow_delay_emb.*embedding.*")))
+    if flow_age_emb:
+        metrics["flow_age_emb_norm"] = jnp.sqrt(jnp.mean(jnp.square(flow_age_emb[0].astype(jnp.float32))))
     return metrics
 
 

@@ -7,8 +7,22 @@ wandb/
 # Local opencode config (permission auto-approve rules, machine-specific).
 opencode.json
 
-# Agent instructions (machine-specific, not for the repo).
+# Local AI/agent instructions and configuration (machine-specific, not for the repo).
 AGENTS.md
+CLAUDE.md
+GEMINI.md
+AI.md
+.ai/
+.agents/
+.aider*
+.claude/
+.codex/
+.cursor/
+
+# Local, untracked test files. Existing tracked tests remain tracked.
+*_test.py
+test_*.py
+conftest.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

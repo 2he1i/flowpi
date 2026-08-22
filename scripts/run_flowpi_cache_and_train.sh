@@ -39,7 +39,7 @@ Environment overrides:
   FLOWPI_TRAIN_CUDA_DEVICES  Physical CUDA_VISIBLE_DEVICES for training (default: 0,...,7).
   FLOWPI_TRAIN_EXPECTED_GPUS Number of GPUs expected by the training launcher (default: 8).
   FLOWPI_GLOBAL_BATCH         Training global batch size (default: 128).
-  FLOWPI_CACHE_BATCH_SIZE     Flow pairs per SEA-RAFT forward pass (default: 16).
+  FLOWPI_CACHE_BATCH_SIZE     Flow pairs per SEA-RAFT forward pass per GPU (default: 64).
   FLOWPI_RESUME_STEP          Optional exact checkpoint step to resume.
 EOF
 }
@@ -104,7 +104,7 @@ WEIGHT_LOADER_PATH="$(env_or FLOWPI_WEIGHT_LOADER_PATH gs://openpi-assets/checkp
 CACHE_CUDA_DEVICES="$(env_or FLOWPI_CACHE_CUDA_DEVICES 0,1,2,3)"
 CACHE_DEVICES="$(env_or FLOWPI_CACHE_DEVICES 0,1,2,3)"
 CACHE_WORKERS="$(env_or FLOWPI_CACHE_WORKERS 4)"
-CACHE_BATCH_SIZE="$(env_or FLOWPI_CACHE_BATCH_SIZE 16)"
+CACHE_BATCH_SIZE="$(env_or FLOWPI_CACHE_BATCH_SIZE 64)"
 CACHE_OVERWRITE="$(env_or FLOWPI_CACHE_OVERWRITE 0)"
 TRAIN_CUDA_DEVICES="$(env_or FLOWPI_TRAIN_CUDA_DEVICES 0,1,2,3,4,5,6,7)"
 TRAIN_EXPECTED_GPUS="$(env_or FLOWPI_TRAIN_EXPECTED_GPUS 8)"

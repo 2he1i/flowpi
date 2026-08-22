@@ -19,7 +19,7 @@ their own row range and multi-file datasets stay aligned with the training loade
 Usage:
   uv run python scripts/precompute_flow_cache.py flowpi_aloha \
       [--data.flow.sea-raft-ckpt /path/to/sea_raft.pth] [--devices 0,1,2,3] \
-      [--batch-size 16] [--max-frames 20]
+      [--batch-size 64] [--max-frames 20]
 """
 
 import argparse
@@ -47,8 +47,8 @@ def _parse_args():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=16,
-        help="Number of flow pairs per SEA-RAFT forward pass (default: 16; conservative for 80GB GPUs).",
+        default=64,
+        help="Number of flow pairs per SEA-RAFT forward pass (default: 64; one 80GB GPU worker).",
     )
     parser.add_argument("--overwrite", action="store_true")
     known, remaining = parser.parse_known_args()

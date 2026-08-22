@@ -42,3 +42,13 @@ index 4c8d92f..0d37681 100644
 +        """Scale a full-resolution padding amount down to the 1/8-resolution grid."""
 +        return pad // factor
 \ No newline at end of file
+diff --git a/core/utils/utils.py b/core/utils/utils.py
+index 2c742c5..c9ee87a 100644
+--- a/core/utils/utils.py
++++ b/core/utils/utils.py
+@@ -77,2 +77,3 @@ def bilinear_sampler(img, coords, mode='bilinear', mask=False):
+-    grid = torch.cat([xgrid, ygrid], dim=-1)
+-    img = F.grid_sample(img, grid, align_corners=True)
++    # cuDNN's grid_sample path requires contiguous tensors for some batched correlation shapes.
++    grid = torch.cat([xgrid, ygrid], dim=-1).contiguous()
++    img = F.grid_sample(img.contiguous(), grid, align_corners=True)

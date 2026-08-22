@@ -27,6 +27,7 @@ We follow this einsum axis naming convention:
 
 from collections.abc import Sequence
 import dataclasses
+import math
 from typing import Literal, TypeAlias
 
 import einops
@@ -422,6 +423,9 @@ class FlowGeom:
     num_heads: int = 8
     head_dim: int = 128
     injection_layers: tuple[int, ...] = (7, 12, 16)
+    # Target magnitude of tanh(flow_gate) at initialization. Zero keeps exact baseline
+    # equivalence; a small positive value is useful for Flow-required training recipes.
+    flow_gate_init: float = 0.0
 
 
 @at.typecheck
@@ -491,8 +495,14 @@ class Module(nn.Module):
                 nn.initializers.lecun_normal(in_axis=(-3, -2), out_axis=-1),
                 (n_slots, n_heads, head_dim, width_e1),
             )
-            # The ONLY zero-initialized flow parameters (initial tanh(gate)=0 => exact π0.5 equivalence).
-            self.flow_gate = self.param("flow_gate", nn.initializers.zeros_init(), (n_slots, width_e1))
+            # flow_pre_norm_scale remains zero-initialized. flow_gate is zero by default for
+            # exact π0.5 equivalence, or receives a small constant raw value whose tanh matches
+            # FlowGeom.flow_gate_init for Flow-required training.
+            if self.flow_geom.flow_gate_init == 0.0:
+                gate_init = nn.initializers.zeros_init()
+            else:
+                gate_init = nn.initializers.constant(math.atanh(self.flow_geom.flow_gate_init))
+            self.flow_gate = self.param("flow_gate", gate_init, (n_slots, width_e1))
             self.flow_pre_norm_scale = self.param(
                 "flow_pre_norm_scale", nn.initializers.zeros_init(), (n_slots, width_e1)
             )

@@ -39,6 +39,11 @@ Environment overrides:
   FLOWPI_TRAIN_CUDA_DEVICES  Physical CUDA_VISIBLE_DEVICES for training (default: 0,...,7).
   FLOWPI_TRAIN_EXPECTED_GPUS Number of GPUs expected by the training launcher (default: 8).
   FLOWPI_GLOBAL_BATCH         Training global batch size (default: 128).
+  FLOWPI_XLA_MEM_FRACTION     XLA GPU memory fraction for training (default: 0.98).
+  FLOWPI_SAVE_INTERVAL        Training checkpoint interval in steps (default: 2000).
+  FLOWPI_FLOW_REQUIRED_PROB   Fraction with forced stale VLM prefix (default: 0).
+  FLOWPI_FLOW_REQUIRED_VLM_DELAY_MIN  Minimum VLM delay on forced samples (default: 0).
+  FLOWPI_FLOW_GATE_INIT        Initial abs(tanh(Flow gate)) (default: 0).
   FLOWPI_CACHE_BATCH_SIZE     Flow pairs per SEA-RAFT forward pass per GPU (default: 64).
   FLOWPI_RESUME_STEP          Optional exact checkpoint step to resume.
 EOF

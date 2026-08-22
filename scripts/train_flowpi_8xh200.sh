@@ -14,6 +14,9 @@
 #   FLOWPI_DATASET_ROOT=/shared/flowpi_data/train_dataset \
 #   FLOWPI_FLOW_CACHE_DIR=/shared/flowpi_data/flow_cache \
 #   FLOWPI_FLOW_DELAY_DISTRIBUTION="1 1 1 1" \
+#   FLOWPI_FLOW_REQUIRED_PROB=0.5 FLOWPI_FLOW_REQUIRED_VLM_DELAY_MIN=5 \
+#   FLOWPI_FLOW_GATE_INIT=0.01 \
+#   FLOWPI_XLA_MEM_FRACTION=0.98 \
 #   FLOWPI_SEA_RAFT_CKPT=/shared/models/robot_sea_raft_m.pth \
 #   FLOWPI_RESUME_STEP=15000 \
 #   FLOWPI_LOG_ROOT=/shared/flowpi_logs \
@@ -82,12 +85,16 @@ GRAD_CLIP="$(env_or FLOWPI_GRAD_CLIP 1.0)"
 EMA_DECAY="$(env_or FLOWPI_EMA_DECAY 0.999)"
 FLOW_DELAY_MAX="$(env_or FLOWPI_FLOW_DELAY_MAX 3)"
 VLM_DELAY_MAX="$(env_or FLOWPI_VLM_DELAY_MAX 10)"
+FLOW_REQUIRED_PROB="$(env_or FLOWPI_FLOW_REQUIRED_PROB 0.0)"
+FLOW_REQUIRED_VLM_DELAY_MIN="$(env_or FLOWPI_FLOW_REQUIRED_VLM_DELAY_MIN 0)"
+FLOW_GATE_INIT="$(env_or FLOWPI_FLOW_GATE_INIT 0.0)"
 NUM_WORKERS="$(env_or FLOWPI_NUM_WORKERS 8)"
 LOG_INTERVAL="$(env_or FLOWPI_LOG_INTERVAL 10)"
-SAVE_INTERVAL="$(env_or FLOWPI_SAVE_INTERVAL 5000)"
+SAVE_INTERVAL="$(env_or FLOWPI_SAVE_INTERVAL 2000)"
 KEEP_PERIOD="$(env_or FLOWPI_KEEP_PERIOD 5000)"
 HEARTBEAT_INTERVAL="$(env_or FLOWPI_HEARTBEAT_INTERVAL 60)"
 SEED="$(env_or FLOWPI_SEED 42)"
+XLA_MEM_FRACTION="$(env_or FLOWPI_XLA_MEM_FRACTION "$(env_or XLA_PYTHON_CLIENT_MEM_FRACTION 0.98)")"
 
 CHECKPOINT_BASE_DIR="$(env_or FLOWPI_CHECKPOINT_BASE_DIR "$REPO_ROOT/checkpoints")"
 CHECKPOINT_DIR="$CHECKPOINT_BASE_DIR/$CONFIG_NAME/$EXP_NAME"
@@ -107,8 +114,18 @@ WANDB_ENABLED="$(env_or FLOWPI_WANDB_ENABLED 0)"
 [[ "$EXPECTED_GPUS" =~ ^[1-9][0-9]*$ ]] || die "FLOWPI_EXPECTED_GPUS must be a positive integer"
 [[ "$GLOBAL_BATCH" =~ ^[1-9][0-9]*$ ]] || die "FLOWPI_GLOBAL_BATCH must be a positive integer"
 (( GLOBAL_BATCH % EXPECTED_GPUS == 0 )) || die "Global batch is not divisible by GPU count"
+[[ "$XLA_MEM_FRACTION" =~ ^0\.[0-9]+$|^1(\.0+)?$ ]] || die \
+    "FLOWPI_XLA_MEM_FRACTION must be a decimal in (0, 1], got: $XLA_MEM_FRACTION"
 [[ "$FLOW_DELAY_MAX" =~ ^[0-9]+$ ]] || die "FLOWPI_FLOW_DELAY_MAX must be a non-negative integer"
 [[ "$VLM_DELAY_MAX" =~ ^[0-9]+$ ]] || die "FLOWPI_VLM_DELAY_MAX must be a non-negative integer"
+[[ "$FLOW_REQUIRED_PROB" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]] || die \
+    "FLOWPI_FLOW_REQUIRED_PROB must be in [0, 1], got: $FLOW_REQUIRED_PROB"
+[[ "$FLOW_REQUIRED_VLM_DELAY_MIN" =~ ^[0-9]+$ ]] || die \
+    "FLOWPI_FLOW_REQUIRED_VLM_DELAY_MIN must be a non-negative integer"
+(( FLOW_REQUIRED_VLM_DELAY_MIN <= VLM_DELAY_MAX )) || die \
+    "FLOWPI_FLOW_REQUIRED_VLM_DELAY_MIN must be <= FLOWPI_VLM_DELAY_MAX"
+[[ "$FLOW_GATE_INIT" =~ ^0(\.[0-9]+)?$ ]] || die \
+    "FLOWPI_FLOW_GATE_INIT must be in [0, 1), got: $FLOW_GATE_INIT"
 [[ "$SEA_RAFT_ITERS" =~ ^[1-9][0-9]*$ ]] || die "FLOWPI_SEA_RAFT_ITERS must be a positive integer"
 case "$SEA_RAFT_VARIANT" in
     S|M|L) ;;
@@ -143,9 +160,12 @@ fi
 
 PER_GPU_BATCH=$((GLOBAL_BATCH / EXPECTED_GPUS))
 log INFO "Target: $EXPECTED_GPUS GPUs, global batch=$GLOBAL_BATCH, per-GPU batch=$PER_GPU_BATCH"
+log INFO "XLA GPU memory fraction: $XLA_MEM_FRACTION"
 log INFO "Schedule: steps=$NUM_STEPS, warmup=$WARMUP_STEPS, peak_lr=$PEAK_LR, end_lr=$DECAY_LR"
 log INFO "Optimizer: AdamW, grad_clip=$GRAD_CLIP, ema=$EMA_DECAY, fsdp_devices=1"
 log INFO "Delays: flow=0..$FLOW_DELAY_MAX, VLM=0..$VLM_DELAY_MAX, sampled independently"
+log INFO "Flow-required slow-prefix dropout: probability=$FLOW_REQUIRED_PROB, VLM delay min=$FLOW_REQUIRED_VLM_DELAY_MIN"
+log INFO "Flow gate initialization: target abs(tanh(gate))=$FLOW_GATE_INIT"
 log INFO "Flow: cache=$FLOW_CACHE_DIR, SEA-RAFT is offline"
 log INFO "SEA-RAFT provenance: ckpt=$SEA_RAFT_CKPT_ARG, variant=$SEA_RAFT_VARIANT, iters=$SEA_RAFT_ITERS"
 log INFO "Trainable: VLM language backbone + Action Expert + Flow modules; frozen: SigLIP vision tower"
@@ -158,6 +178,7 @@ log INFO "Checkpoint directory: $CHECKPOINT_DIR"
 export CUDA_VISIBLE_DEVICES="$(env_or CUDA_VISIBLE_DEVICES 0,1,2,3,4,5,6,7)"
 export JAX_PLATFORMS="$(env_or JAX_PLATFORMS gpu)"
 export JAX_TRACEBACK_FILTERING="$(env_or JAX_TRACEBACK_FILTERING off)"
+export XLA_PYTHON_CLIENT_MEM_FRACTION="$XLA_MEM_FRACTION"
 export PYTHONUNBUFFERED=1
 export NCCL_ASYNC_ERROR_HANDLING="$(env_or NCCL_ASYNC_ERROR_HANDLING 1)"
 export NCCL_DEBUG="$(env_or NCCL_DEBUG INFO)"
@@ -225,6 +246,7 @@ fi
     printf 'expected_gpus=%s\n' "$EXPECTED_GPUS"
     printf 'global_batch=%s\n' "$GLOBAL_BATCH"
     printf 'per_gpu_batch=%s\n' "$PER_GPU_BATCH"
+    printf 'xla_python_client_mem_fraction=%s\n' "$XLA_PYTHON_CLIENT_MEM_FRACTION"
     printf 'num_steps=%s\n' "$NUM_STEPS"
     printf 'warmup_steps=%s\n' "$WARMUP_STEPS"
     printf 'peak_lr=%s\n' "$PEAK_LR"
@@ -234,6 +256,9 @@ fi
     printf 'flow_delay_max=%s\n' "$FLOW_DELAY_MAX"
     printf 'flow_delay_distribution=%s\n' "${FLOW_DELAY_DISTRIBUTION[*]}"
     printf 'vlm_delay_max=%s\n' "$VLM_DELAY_MAX"
+    printf 'flow_required_prob=%s\n' "$FLOW_REQUIRED_PROB"
+    printf 'flow_required_vlm_delay_min=%s\n' "$FLOW_REQUIRED_VLM_DELAY_MIN"
+    printf 'flow_gate_init=%s\n' "$FLOW_GATE_INIT"
     printf 'num_workers=%s\n' "$NUM_WORKERS"
     printf 'resume=%s\n' "$RESUME"
     printf 'resume_step=%s\n' "${RESUME_STEP:-latest}"
@@ -324,6 +349,7 @@ write_command_log() {
         --model.flow.vlm-delay-max "$VLM_DELAY_MAX" \
         --model.flow.flow-delay-max "$FLOW_DELAY_MAX" \
         --model.flow.flow-delay-distribution "${FLOW_DELAY_DISTRIBUTION[@]}" \
+        --model.flow.flow-gate-init "$FLOW_GATE_INIT" \
         --model.flow.no-image-geometric-aug \
         --lr-schedule.warmup-steps "$WARMUP_STEPS" \
         --lr-schedule.peak-lr "$PEAK_LR" \
@@ -341,6 +367,8 @@ write_command_log() {
         --data.flow.sea-raft-iters "$SEA_RAFT_ITERS" \
         --data.flow.sea-raft-device cpu \
         --data.flow.load-flow-cache --data.flow.sample-vlm-delay \
+        --data.flow.flow-required-prob "$FLOW_REQUIRED_PROB" \
+        --data.flow.flow-required-vlm-delay-min "$FLOW_REQUIRED_VLM_DELAY_MIN" \
         --weight-loader.params-path "$WEIGHT_LOADER_PATH" \
         "$WANDB_FLAG" "$RESUME_FLAG" "$OVERWRITE_FLAG" "${RESUME_STEP_ARGS[@]}"
     printf '%s\n' ""
@@ -370,7 +398,7 @@ heartbeat_loop() {
             tail -n 8 "$RUN_LOG" 2>&1 || true
             printf '\ncheckpoint_steps:\n'
             if [[ -d "$CHECKPOINT_DIR" ]]; then
-                find "$CHECKPOINT_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -n 2>/dev/null || true
+                find -L "$CHECKPOINT_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -n 2>/dev/null || true
             else
                 printf 'checkpoint directory not created yet\n'
             fi
@@ -443,6 +471,7 @@ run_training() {
         --model.flow.vlm-delay-max "$VLM_DELAY_MAX" \
         --model.flow.flow-delay-max "$FLOW_DELAY_MAX" \
         --model.flow.flow-delay-distribution "${FLOW_DELAY_DISTRIBUTION[@]}" \
+        --model.flow.flow-gate-init "$FLOW_GATE_INIT" \
         --model.flow.no-image-geometric-aug \
         --lr-schedule.warmup-steps "$WARMUP_STEPS" \
         --lr-schedule.peak-lr "$PEAK_LR" \
@@ -461,6 +490,8 @@ run_training() {
         --data.flow.sea-raft-device cpu \
         --data.flow.load-flow-cache \
         --data.flow.sample-vlm-delay \
+        --data.flow.flow-required-prob "$FLOW_REQUIRED_PROB" \
+        --data.flow.flow-required-vlm-delay-min "$FLOW_REQUIRED_VLM_DELAY_MIN" \
         --weight-loader.params-path "$WEIGHT_LOADER_PATH" \
         "$WANDB_FLAG" "$RESUME_FLAG" "$OVERWRITE_FLAG" "${RESUME_STEP_ARGS[@]}"
 }

@@ -101,6 +101,35 @@ Training keeps the dataset/control tick at the dataset FPS (V1: 50 Hz). The onli
 publishes the synchronous flow observation with `flow_delay=0`, but its telemetry now exposes the
 future contract fields `flow_source_tick`, `flow_delay_ticks`, and `flow_delay_ms`.
 
+## M8 — Flow-required training comparison
+
+The baseline remains exactly compatible with the previous zero-gate recipe:
+`FlowConfig.flow_gate_init=0.0`, `FlowDataConfig.flow_required_prob=0.0`, and
+`flow_required_vlm_delay_min=0` preserve the prior sampling and identity initialization.
+
+The opt-in comparison launcher `scripts/train_flowpi_flow_required_8xh200.sh` adds two targeted
+changes for the modality-laziness experiment:
+
+```text
+Flow-required samples:
+    with probability p, sample VLM delay from [flow_required_vlm_delay_min, vlm_delay_max]
+    while sampling flow_delay independently from the configured flow distribution
+
+Flow gate:
+    initialize raw gate parameters to atanh(flow_gate_init), so tanh(gate) starts at the
+    requested small magnitude (default comparison value: 0.01)
+```
+
+This is the slow-prefix dropout variant: the competing VLM prefix is deliberately stale on a
+subset of samples, while the cached Flow branch remains a real historical observation with its
+own independently sampled age. It does not add a Flow reconstruction loss, alter πR², or change
+the internal `K × stride` meaning of a cache row. The comparison run uses a separate log and
+checkpoint namespace, leaving the original `flowpi_8xh200` and its step-2000 checkpoint intact.
+
+Training simulates asynchronous channel freshness by selecting historical cached observations.
+Future online runtime will replace this sampling with actual worker completion timestamps while
+preserving exactly the same model input semantics.
+
 ## Review Fixes (GPT-review pass, main branch)
 
 ### P0 — Offline cache correctness

@@ -1,4 +1,5 @@
 import dataclasses
+import math
 from typing import TYPE_CHECKING
 
 import flax.nnx as nnx
@@ -35,6 +36,10 @@ class FlowConfig:
     num_cross_heads: int = 8
     cross_head_dim: int = 128
     injection_layers: tuple[int, ...] | None = None  # None => (7, 12, 16)
+    # Initial magnitude of tanh(flow_gate). The default preserves the exact π0.5-compatible
+    # zero-gate initialization; a small non-zero value lets a Flow-required training recipe
+    # propagate signal through the tokenizer/CA branch from the first update.
+    flow_gate_init: float = 0.0
     # πR².
     d_max: int = 5  # must be < action_horizon / 2
     p_standard: float = 0.2
@@ -134,6 +139,8 @@ class FlowConfig:
             raise ValueError(f"num_cross_heads must be positive, got {self.num_cross_heads}")
         if self.cross_head_dim <= 0:
             raise ValueError(f"cross_head_dim must be positive, got {self.cross_head_dim}")
+        if not math.isfinite(self.flow_gate_init) or not 0.0 <= self.flow_gate_init < 1.0:
+            raise ValueError(f"flow_gate_init must be finite and in [0, 1), got {self.flow_gate_init}")
         if self.injection_layers is not None:
             if any(layer < 0 for layer in self.injection_layers):
                 raise ValueError(f"injection_layers must be non-negative, got {self.injection_layers}")
@@ -189,14 +196,14 @@ class Pi0Config(_model.BaseModelConfig):
                 "max-autotune-no-cudagraphs",
             ]
         if self.flow is not None and self.flow.enabled:
-            assert (
-                self.flow.d_max < self.action_horizon / 2
-            ), f"flow.d_max ({self.flow.d_max}) must be < action_horizon/2 ({self.action_horizon / 2})"
+            assert self.flow.d_max < self.action_horizon / 2, (
+                f"flow.d_max ({self.flow.d_max}) must be < action_horizon/2 ({self.action_horizon / 2})"
+            )
             depth = _gemma.get_config(self.action_expert_variant).depth
             for layer in self.flow.injection_layers:
-                assert (
-                    0 <= layer < depth
-                ), f"flow injection layer {layer} is out of range for action expert depth {depth}"
+                assert 0 <= layer < depth, (
+                    f"flow injection layer {layer} is out of range for action expert depth {depth}"
+                )
 
     @property
     @override

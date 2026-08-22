@@ -107,6 +107,36 @@ def test_flow_and_vlm_delays_are_independent(tmp_path):
     np.testing.assert_array_equal(out["flow"][_CAM][:, 0, 0, 0], [900, 901])
 
 
+def test_flow_required_sampling_forces_stale_vlm_prefix_without_crossing_episode_start():
+    frame_offsets = _transforms.compute_image_frame_offsets(_K, _STRIDE, vlm_delay_max=4, flow_delay_max=3)
+    transform = _transforms.DelaySlowImage(
+        4,
+        frame_offsets,
+        distribution=(1.0, 1.0, 1.0, 1.0, 1.0),
+        flow_required_prob=1.0,
+        flow_required_vlm_delay_min=3,
+    )
+
+    for _ in range(32):
+        current = 8
+        images = {
+            _CAM: np.stack([np.full((3, 2, 2), current + offset, dtype=np.uint8) for offset in frame_offsets], axis=0)
+        }
+        out = transform({"images": images, "episode_index": 0, "frame_index": current})
+        assert 3 <= out["vlm_delay"] <= 4
+        np.testing.assert_array_equal(out["images"][_CAM], images[_CAM][frame_offsets.index(-out["vlm_delay"])])
+
+    # At episode tick 1, only delays 0 and 1 are reachable. The forced lower bound is clamped to 1,
+    # so the transform must select the current episode's first frame, never a previous episode frame.
+    current = 1
+    images = {
+        _CAM: np.stack([np.full((3, 2, 2), current + offset, dtype=np.uint8) for offset in frame_offsets], axis=0)
+    }
+    out = transform({"images": images, "episode_index": 1, "frame_index": current})
+    assert out["vlm_delay"] == 1
+    np.testing.assert_array_equal(out["images"][_CAM], images[_CAM][frame_offsets.index(-1)])
+
+
 def test_online_flow_uses_stale_target_but_keeps_internal_stride():
     frame_offsets = _transforms.compute_image_frame_offsets(_K, _STRIDE, vlm_delay_max=0, flow_delay_max=3)
     current = 8

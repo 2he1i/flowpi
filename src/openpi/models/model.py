@@ -68,6 +68,7 @@ IMAGE_RESOLUTION = (224, 224)
 #     "tokenized_prompt_mask": bool[*b, l],  # Optional, mask for tokenized prompt
 #     "token_ar_mask": int32[*b, l],  # Optional, autoregressive mask for FAST model
 #     "token_loss_mask": bool[*b, l],  # Optional, loss mask for FAST model
+#     "vlm_delay": int32[*b],  # Optional, age of the slow VLM prefix
 #     "flow_delay": int32[*b],  # Optional, age of the cached flow target tick
 #
 #      # Actions data.

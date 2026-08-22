@@ -404,17 +404,29 @@ def _sample_reachable_delay(
     frame_index: int,
     delay_max: int,
     distribution: np.ndarray | None,
+    *,
+    min_delay: int = 0,
 ) -> int:
-    """Samples a delay after restricting its support to frames in the current episode."""
-    max_delay = min(delay_max, max(frame_index, 0))
-    if distribution is None:
-        return int(rng.integers(0, max_delay + 1))
+    """Samples a delay after restricting its support to reachable episode frames.
 
-    reachable = distribution[: max_delay + 1]
+    ``min_delay`` is used by the Flow-required slow-prefix recipe to bias a subset of samples
+    toward stale VLM observations. It is clamped at the episode boundary in the same way as the
+    upper bound, so it can never read from a previous episode.
+    """
+    max_delay = min(delay_max, max(frame_index, 0))
+    min_delay = min(max(min_delay, 0), max_delay)
+    if distribution is None:
+        return int(rng.integers(min_delay, max_delay + 1))
+
+    reachable = distribution[min_delay : max_delay + 1]
     total = reachable.sum()
     if total <= 0:
-        return int(rng.integers(0, max_delay + 1))
-    return int(rng.choice(max_delay + 1, p=reachable / total))
+        return int(rng.integers(min_delay, max_delay + 1))
+    if min_delay == 0:
+        # Preserve the pre-Flow-required VLM sampling call and RNG sequence exactly when the
+        # optional lower bound is inactive.
+        return int(rng.choice(max_delay + 1, p=reachable / total))
+    return int(rng.choice(np.arange(min_delay, max_delay + 1), p=reachable / total))
 
 
 def _resolve_delay(
@@ -719,6 +731,11 @@ class DelaySlowImage(DataTransformFn):
     per-call counter keeps consecutive samples within one worker varied — like the online
     runtime. The sampled delay never exceeds the frame index (a runtime refresh can never reach
     further back than the episode start).
+
+    ``flow_required_prob`` implements the Flow-required/slow-prefix-dropout recipe: on that
+    fraction of samples, the VLM delay is sampled only from ``flow_required_vlm_delay_min`` to
+    ``vlm_delay_max``. The Flow channel itself remains independently sampled by LoadFlowCache or
+    ComputeFlow; this transform only weakens the competing slow prefix.
     """
 
     def __init__(
@@ -728,11 +745,24 @@ class DelaySlowImage(DataTransformFn):
         *,
         seed: int = 0,
         distribution: Sequence[float] | None = None,
+        flow_required_prob: float = 0.0,
+        flow_required_vlm_delay_min: int = 0,
     ):
         self.vlm_delay_max = vlm_delay_max
         self.frame_offsets = tuple(frame_offsets)
         self.seed = seed
         self._calls = 0
+        self.flow_required_prob = flow_required_prob
+        self.flow_required_vlm_delay_min = flow_required_vlm_delay_min
+        if not 0.0 <= flow_required_prob <= 1.0:
+            raise ValueError(f"flow_required_prob must be in [0, 1], got {flow_required_prob}")
+        if flow_required_vlm_delay_min < 0:
+            raise ValueError(f"flow_required_vlm_delay_min must be non-negative, got {flow_required_vlm_delay_min}")
+        if flow_required_vlm_delay_min > vlm_delay_max:
+            raise ValueError(
+                "flow_required_vlm_delay_min must be no greater than vlm_delay_max, "
+                f"got {flow_required_vlm_delay_min} > {vlm_delay_max}"
+            )
         self.distribution = None if distribution is None else np.asarray(list(distribution), dtype=np.float64)
         if self.distribution is not None:
             if len(self.distribution) != vlm_delay_max + 1:
@@ -755,7 +785,14 @@ class DelaySlowImage(DataTransformFn):
         frame_index = int(np.asarray(data["frame_index"]).item())
         rng = _delay_rng(self.seed, _worker_id(), self._calls, stream_id=0)
         self._calls += 1
-        d_vlm = _sample_reachable_delay(rng, frame_index, self.vlm_delay_max, self.distribution)
+        required = self.flow_required_prob > 0.0 and rng.random() < self.flow_required_prob
+        d_vlm = _sample_reachable_delay(
+            rng,
+            frame_index,
+            self.vlm_delay_max,
+            self.distribution,
+            min_delay=self.flow_required_vlm_delay_min if required else 0,
+        )
 
         idx = frame_offset_index(self.frame_offsets, -d_vlm) if d_vlm > 0 else frame_offset_index(self.frame_offsets, 0)
         data["images"] = {cam: np.asarray(stack)[idx] for cam, stack in images.items()}

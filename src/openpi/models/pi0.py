@@ -96,6 +96,7 @@ class Pi0(_model.BaseModel):
                 num_heads=flow_cfg.num_cross_heads,
                 head_dim=flow_cfg.cross_head_dim,
                 injection_layers=tuple(injection_layers),
+                flow_gate_init=flow_cfg.flow_gate_init,
             )
 
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -445,9 +446,17 @@ class Pi0(_model.BaseModel):
                 else jnp.asarray(observation.flow_delay, dtype=jnp.float32)
             )
             flow_delay = jnp.clip(flow_delay, 0, self.flow_config.flow_delay_max)
+            vlm_delay = (
+                jnp.zeros(observation.state.shape[:-1], dtype=jnp.float32)
+                if observation.vlm_delay is None
+                else jnp.asarray(observation.vlm_delay, dtype=jnp.float32)
+            )
+            vlm_delay = jnp.clip(vlm_delay, 0, self.flow_config.vlm_delay_max)
             flow_delay_metrics = {
                 "mean_flow_delay": jnp.mean(flow_delay),
                 "frac_flow_delay_0": jnp.mean((flow_delay == 0).astype(jnp.float32)),
+                "mean_vlm_delay": jnp.mean(vlm_delay),
+                "frac_vlm_delay_max": jnp.mean((vlm_delay == self.flow_config.vlm_delay_max).astype(jnp.float32)),
             }
         if self.flow_config is not None and self.pi05 and self.flow_config.use_pir2:
             # Renormalize valid positions so the outer mean matches the baseline π0.5 loss scale.

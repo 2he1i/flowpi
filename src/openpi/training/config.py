@@ -91,11 +91,22 @@ class FlowDataConfig:
     load_flow_cache: bool = True
     # Include the DelaySlowImage transform (stale VLM image simulation).
     sample_vlm_delay: bool = True
+    # Flow-required slow-prefix recipe: on this fraction of samples, restrict the VLM delay to
+    # the stale tail while keeping Flow age sampling independent. Defaults preserve the existing
+    # training distribution exactly.
+    flow_required_prob: float = 0.0
+    flow_required_vlm_delay_min: int = 0
 
     def __post_init__(self) -> None:
         from openpi.training.sea_raft import resolve_sea_raft_iters
 
         object.__setattr__(self, "sea_raft_iters", resolve_sea_raft_iters(self.sea_raft_variant, self.sea_raft_iters))
+        if not 0.0 <= self.flow_required_prob <= 1.0:
+            raise ValueError(f"flow_required_prob must be in [0, 1], got {self.flow_required_prob}")
+        if self.flow_required_vlm_delay_min < 0:
+            raise ValueError(
+                f"flow_required_vlm_delay_min must be non-negative, got {self.flow_required_vlm_delay_min}"
+            )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -377,7 +388,12 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
             if self.flow.sample_vlm_delay:
                 flow_transforms.append(
                     _transforms.DelaySlowImage(
-                        model_flow.vlm_delay_max, frame_offsets, seed=0, distribution=model_flow.vlm_delay_distribution
+                        model_flow.vlm_delay_max,
+                        frame_offsets,
+                        seed=0,
+                        distribution=model_flow.vlm_delay_distribution,
+                        flow_required_prob=self.flow.flow_required_prob,
+                        flow_required_vlm_delay_min=self.flow.flow_required_vlm_delay_min,
                     )
                 )
             if flow_transforms:

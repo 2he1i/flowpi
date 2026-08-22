@@ -1347,15 +1347,15 @@ _CONFIGS = [
         batch_size=32,
     ),
     TrainConfig(
-        # Memory-aware FlowPI recipe for eight 24 GB RTX 4090 GPUs. Only the PaliGemma VLM
-        # language backbone uses LoRA; the Action Expert and all FlowPI modules remain full
-        # parameter trainable, while SigLIP is frozen.
+        # Memory-aware FlowPI recipe for eight RTX 4090 GPUs. The PaliGemma VLM and Action
+        # Expert use LoRA; all FlowPI modules remain full-parameter trainable, while SigLIP is
+        # frozen.
         name="flowpi_aloha_8x4090_lora",
         model=pi0_config.Pi0Config(
             pi05=True,
             discrete_state_input=False,
             paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m",
+            action_expert_variant="gemma_300m_lora",
             flow=pi0_config.FlowConfig(),
             freeze_vision_encoder=True,
         ),
@@ -1394,7 +1394,7 @@ _CONFIGS = [
             pi05=True,
             discrete_state_input=False,
             paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m",
+            action_expert_variant="gemma_300m_lora",
             flow=pi0_config.FlowConfig(),
             freeze_vision_encoder=True,
         ).get_freeze_filter(),

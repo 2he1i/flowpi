@@ -3,7 +3,7 @@
 #
 # The durable logging, heartbeat, GPU telemetry, resume, and checkpoint behavior lives in
 # train_flowpi_8xh200.sh. This wrapper only supplies an isolated recipe for the 4090 host:
-# VLM LoRA, full Action Expert + FlowPI modules, frozen SigLIP, and global batch 32.
+# VLM + Action Expert LoRA, full FlowPI modules, frozen SigLIP, and global batch 32.
 
 set -Eeuo pipefail
 
@@ -24,8 +24,8 @@ export FLOWPI_PEAK_LR="${FLOWPI_PEAK_LR:-5e-5}"
 export FLOWPI_DECAY_LR="${FLOWPI_DECAY_LR:-5e-6}"
 export FLOWPI_GRAD_CLIP="${FLOWPI_GRAD_CLIP:-1.0}"
 
-# LoRA recipes do not keep a second full-model EMA copy. This leaves more 24 GB memory for
-# the full Action Expert and FlowPI branches while still saving complete train_state checkpoints.
+# LoRA recipes do not keep a second full-model EMA copy. This leaves more memory for the
+# trainable LoRA and FlowPI branches while still saving complete train_state checkpoints.
 export FLOWPI_EMA_DECAY="${FLOWPI_EMA_DECAY:-None}"
 export FLOWPI_SAVE_INTERVAL="${FLOWPI_SAVE_INTERVAL:-2000}"
 export FLOWPI_KEEP_PERIOD="${FLOWPI_KEEP_PERIOD:-2000}"

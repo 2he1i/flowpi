@@ -3,7 +3,7 @@
 这套配置与 H100/H200 训练完全隔离：
 
 - VLM language backbone：LoRA
-- Action Expert：全参数训练
+- Action Expert：LoRA
 - Flow tokenizer / cross-attention / gate / delay embedding：全参数训练
 - SigLIP：冻结
 - SEA-RAFT：只读取已有 cache，不参与 policy training

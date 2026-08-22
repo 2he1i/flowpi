@@ -17,7 +17,7 @@ single source of truth (see `episode_frames`), so episodes sharing a parquet fil
 their own row range and multi-file datasets stay aligned with the training loader.
 
 Usage:
-  uv run python scripts/precompute_flow_cache.py --config-name flowpi_aloha \
+  uv run python scripts/precompute_flow_cache.py flowpi_aloha \
       [--data.flow.sea-raft-ckpt /path/to/sea_raft.pth] [--max-frames 20] [--num-workers 4]
 """
 

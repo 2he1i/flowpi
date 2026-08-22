@@ -14,6 +14,7 @@
 #   FLOWPI_DATASET_ROOT=/shared/flowpi_data/train_dataset \
 #   FLOWPI_FLOW_CACHE_DIR=/shared/flowpi_data/flow_cache \
 #   FLOWPI_FLOW_DELAY_DISTRIBUTION="1 1 1 1" \
+#   FLOWPI_SEA_RAFT_CKPT=/shared/models/robot_sea_raft_m.pth \
 #   FLOWPI_LOG_ROOT=/shared/flowpi_logs \
 #   bash scripts/train_flowpi_8xh200.sh
 #
@@ -91,6 +92,9 @@ CHECKPOINT_BASE_DIR="$(env_or FLOWPI_CHECKPOINT_BASE_DIR "$REPO_ROOT/checkpoints
 CHECKPOINT_DIR="$CHECKPOINT_BASE_DIR/$CONFIG_NAME/$EXP_NAME"
 DATASET_ROOT="$(env_or FLOWPI_DATASET_ROOT "$REPO_ROOT/flowpi_data/train_dataset")"
 FLOW_CACHE_DIR="$(env_or FLOWPI_FLOW_CACHE_DIR "$REPO_ROOT/flowpi_data/flow_cache")"
+SEA_RAFT_CKPT="$(env_or FLOWPI_SEA_RAFT_CKPT "")"
+SEA_RAFT_VARIANT="$(env_or FLOWPI_SEA_RAFT_VARIANT M)"
+SEA_RAFT_ITERS="$(env_or FLOWPI_SEA_RAFT_ITERS 4)"
 ASSETS_DIR="$(env_or FLOWPI_ASSETS_DIR "$REPO_ROOT/assets/flowpi_aloha")"
 ASSET_ID="$(env_or FLOWPI_ASSET_ID flowpi_data/train_dataset)"
 WEIGHT_LOADER_PATH="$(env_or FLOWPI_WEIGHT_LOADER_PATH gs://openpi-assets/checkpoints/pi05_base/params)"
@@ -103,10 +107,21 @@ WANDB_ENABLED="$(env_or FLOWPI_WANDB_ENABLED 0)"
 (( GLOBAL_BATCH % EXPECTED_GPUS == 0 )) || die "Global batch is not divisible by GPU count"
 [[ "$FLOW_DELAY_MAX" =~ ^[0-9]+$ ]] || die "FLOWPI_FLOW_DELAY_MAX must be a non-negative integer"
 [[ "$VLM_DELAY_MAX" =~ ^[0-9]+$ ]] || die "FLOWPI_VLM_DELAY_MAX must be a non-negative integer"
+[[ "$SEA_RAFT_ITERS" =~ ^[1-9][0-9]*$ ]] || die "FLOWPI_SEA_RAFT_ITERS must be a positive integer"
+case "$SEA_RAFT_VARIANT" in
+    S|M|L) ;;
+    *) die "FLOWPI_SEA_RAFT_VARIANT must be S, M, or L" ;;
+esac
 [[ "$RESUME" == 0 || "$RESUME" == 1 ]] || die "FLOWPI_RESUME must be 0 or 1"
 [[ "$OVERWRITE" == 0 || "$OVERWRITE" == 1 ]] || die "FLOWPI_OVERWRITE must be 0 or 1"
 [[ "$WANDB_ENABLED" == 0 || "$WANDB_ENABLED" == 1 ]] || die "FLOWPI_WANDB_ENABLED must be 0 or 1"
 [[ "$RESUME:$OVERWRITE" != 1:1 ]] || die "Resume and overwrite cannot both be enabled"
+
+SEA_RAFT_CKPT_ARG=None
+if [[ -n "$SEA_RAFT_CKPT" ]]; then
+    [[ -f "$SEA_RAFT_CKPT" ]] || die "SEA-RAFT checkpoint does not exist: $SEA_RAFT_CKPT"
+    SEA_RAFT_CKPT_ARG="$SEA_RAFT_CKPT"
+fi
 
 FLOW_DELAY_DISTRIBUTION_RAW="$(env_or FLOWPI_FLOW_DELAY_DISTRIBUTION "")"
 if [[ -n "$FLOW_DELAY_DISTRIBUTION_RAW" ]]; then
@@ -126,6 +141,7 @@ log INFO "Schedule: steps=$NUM_STEPS, warmup=$WARMUP_STEPS, peak_lr=$PEAK_LR, en
 log INFO "Optimizer: AdamW, grad_clip=$GRAD_CLIP, ema=$EMA_DECAY, fsdp_devices=1"
 log INFO "Delays: flow=0..$FLOW_DELAY_MAX, VLM=0..$VLM_DELAY_MAX, sampled independently"
 log INFO "Flow: cache=$FLOW_CACHE_DIR, SEA-RAFT is offline"
+log INFO "SEA-RAFT provenance: ckpt=$SEA_RAFT_CKPT_ARG, variant=$SEA_RAFT_VARIANT, iters=$SEA_RAFT_ITERS"
 log INFO "Trainable: VLM language backbone + Action Expert + Flow modules; frozen: SigLIP vision tower"
 log INFO "Geometry: image geometric augmentation disabled to preserve raw-cache coordinates"
 log INFO "Checkpoint directory: $CHECKPOINT_DIR"
@@ -217,6 +233,9 @@ fi
     printf 'wandb_enabled=%s\n' "$WANDB_ENABLED"
     printf 'dataset_root=%s\n' "$DATASET_ROOT"
     printf 'flow_cache_dir=%s\n' "$FLOW_CACHE_DIR"
+    printf 'sea_raft_ckpt=%s\n' "$SEA_RAFT_CKPT_ARG"
+    printf 'sea_raft_variant=%s\n' "$SEA_RAFT_VARIANT"
+    printf 'sea_raft_iters=%s\n' "$SEA_RAFT_ITERS"
     printf 'assets_dir=%s\n' "$ASSETS_DIR"
     printf 'checkpoint_dir=%s\n' "$CHECKPOINT_DIR"
     printf 'python_command=%s\n' "$PYTHON_DISPLAY"
@@ -303,7 +322,9 @@ write_command_log() {
         --data.assets.asset-id "$ASSET_ID" \
         --data.flow.mode cache \
         --data.flow.flow-cache-dir "$FLOW_CACHE_DIR" \
-        --data.flow.sea-raft-ckpt None \
+        --data.flow.sea-raft-ckpt "$SEA_RAFT_CKPT_ARG" \
+        --data.flow.sea-raft-variant "$SEA_RAFT_VARIANT" \
+        --data.flow.sea-raft-iters "$SEA_RAFT_ITERS" \
         --data.flow.sea-raft-device cpu \
         --data.flow.load-flow-cache --data.flow.sample-vlm-delay \
         --weight-loader.params-path "$WEIGHT_LOADER_PATH" \
@@ -420,7 +441,9 @@ run_training() {
         --data.assets.asset-id "$ASSET_ID" \
         --data.flow.mode cache \
         --data.flow.flow-cache-dir "$FLOW_CACHE_DIR" \
-        --data.flow.sea-raft-ckpt None \
+        --data.flow.sea-raft-ckpt "$SEA_RAFT_CKPT_ARG" \
+        --data.flow.sea-raft-variant "$SEA_RAFT_VARIANT" \
+        --data.flow.sea-raft-iters "$SEA_RAFT_ITERS" \
         --data.flow.sea-raft-device cpu \
         --data.flow.load-flow-cache \
         --data.flow.sample-vlm-delay \

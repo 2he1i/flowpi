@@ -39,6 +39,7 @@ Environment overrides:
   FLOWPI_TRAIN_CUDA_DEVICES  Physical CUDA_VISIBLE_DEVICES for training (default: 0,...,7).
   FLOWPI_TRAIN_EXPECTED_GPUS Number of GPUs expected by the training launcher (default: 8).
   FLOWPI_GLOBAL_BATCH         Training global batch size (default: 128).
+  FLOWPI_CACHE_BATCH_SIZE     Flow pairs per SEA-RAFT forward pass (default: 16).
   FLOWPI_RESUME_STEP          Optional exact checkpoint step to resume.
 EOF
 }
@@ -103,6 +104,7 @@ WEIGHT_LOADER_PATH="$(env_or FLOWPI_WEIGHT_LOADER_PATH gs://openpi-assets/checkp
 CACHE_CUDA_DEVICES="$(env_or FLOWPI_CACHE_CUDA_DEVICES 0,1,2,3)"
 CACHE_DEVICES="$(env_or FLOWPI_CACHE_DEVICES 0,1,2,3)"
 CACHE_WORKERS="$(env_or FLOWPI_CACHE_WORKERS 4)"
+CACHE_BATCH_SIZE="$(env_or FLOWPI_CACHE_BATCH_SIZE 16)"
 CACHE_OVERWRITE="$(env_or FLOWPI_CACHE_OVERWRITE 0)"
 TRAIN_CUDA_DEVICES="$(env_or FLOWPI_TRAIN_CUDA_DEVICES 0,1,2,3,4,5,6,7)"
 TRAIN_EXPECTED_GPUS="$(env_or FLOWPI_TRAIN_EXPECTED_GPUS 8)"
@@ -112,6 +114,7 @@ GLOBAL_BATCH="$(env_or FLOWPI_GLOBAL_BATCH 128)"
     "FLOWPI_SEA_RAFT_VARIANT must be S, M, or L"
 [[ "$SEA_RAFT_ITERS" =~ ^[1-9][0-9]*$ ]] || die "FLOWPI_SEA_RAFT_ITERS must be a positive integer"
 [[ "$CACHE_WORKERS" =~ ^[1-9][0-9]*$ ]] || die "FLOWPI_CACHE_WORKERS must be a positive integer"
+[[ "$CACHE_BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] || die "FLOWPI_CACHE_BATCH_SIZE must be a positive integer"
 [[ "$CACHE_OVERWRITE" == 0 || "$CACHE_OVERWRITE" == 1 ]] || die "FLOWPI_CACHE_OVERWRITE must be 0 or 1"
 [[ "$TRAIN_EXPECTED_GPUS" =~ ^[1-9][0-9]*$ ]] || die "FLOWPI_TRAIN_EXPECTED_GPUS must be a positive integer"
 [[ "$GLOBAL_BATCH" =~ ^[1-9][0-9]*$ ]] || die "FLOWPI_GLOBAL_BATCH must be a positive integer"
@@ -184,6 +187,7 @@ CKPT_SHA256="$(sha256sum "$SEA_RAFT_CKPT" | awk '{print $1}')"
     printf 'cache_cuda_visible_devices=%s\n' "$CACHE_CUDA_DEVICES"
     printf 'cache_devices=%s\n' "$CACHE_DEVICES"
     printf 'cache_workers=%s\n' "$CACHE_WORKERS"
+    printf 'cache_batch_size=%s\n' "$CACHE_BATCH_SIZE"
     printf 'cache_overwrite=%s\n' "$CACHE_OVERWRITE"
     printf 'train_cuda_visible_devices=%s\n' "$TRAIN_CUDA_DEVICES"
     printf 'train_expected_gpus=%s\n' "$TRAIN_EXPECTED_GPUS"
@@ -230,6 +234,7 @@ write_cache_command() {
         --data.flow.sea-raft-device cuda
         --devices "$CACHE_DEVICES"
         --num-workers "$CACHE_WORKERS"
+        --batch-size "$CACHE_BATCH_SIZE"
     )
     if [[ "$CACHE_OVERWRITE" == 1 ]]; then
         args+=(--overwrite)
@@ -264,6 +269,7 @@ run_cache() {
         --data.flow.sea-raft-device cuda
         --devices "$CACHE_DEVICES"
         --num-workers "$CACHE_WORKERS"
+        --batch-size "$CACHE_BATCH_SIZE"
     )
     if [[ "$CACHE_OVERWRITE" == 1 ]]; then
         args+=(--overwrite)

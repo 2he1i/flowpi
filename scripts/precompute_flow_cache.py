@@ -18,7 +18,8 @@ their own row range and multi-file datasets stay aligned with the training loade
 
 Usage:
   uv run python scripts/precompute_flow_cache.py flowpi_aloha \
-      [--data.flow.sea-raft-ckpt /path/to/sea_raft.pth] [--devices 0,1,2,3] [--max-frames 20]
+      [--data.flow.sea-raft-ckpt /path/to/sea_raft.pth] [--devices 0,1,2,3] \
+      [--batch-size 16] [--max-frames 20]
 """
 
 import argparse
@@ -42,6 +43,12 @@ def _parse_args():
         type=str,
         default=None,
         help="Comma-separated logical CUDA device ids. Starts one fixed worker per device.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=16,
+        help="Number of flow pairs per SEA-RAFT forward pass (default: 16; conservative for 80GB GPUs).",
     )
     parser.add_argument("--overwrite", action="store_true")
     known, remaining = parser.parse_known_args()
@@ -206,6 +213,8 @@ def _partition_tasks(tasks: list[dict], devices: list[str]) -> list[list[dict]]:
 
 def main():
     extra, train_config = _parse_args()
+    if extra.batch_size <= 0:
+        raise ValueError(f"--batch-size must be positive, got {extra.batch_size}")
     model_flow = getattr(train_config.model, "flow", None)
     if model_flow is None or not model_flow.enabled:
         raise ValueError("Precomputing the flow cache requires a config with model.flow enabled.")
@@ -270,7 +279,7 @@ def main():
             "sea_raft_iters": flow_cfg.sea_raft_iters,
             "sea_raft_device": flow_cfg.sea_raft_device,
             "sea_raft_allow_random_init": flow_cfg.sea_raft_allow_random_init,
-            "batch_size": 16,
+            "batch_size": extra.batch_size,
             "verbose": extra.num_workers <= 1,
         }
         for entry in entries

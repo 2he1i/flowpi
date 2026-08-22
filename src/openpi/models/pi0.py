@@ -438,6 +438,7 @@ class Pi0(_model.BaseModel):
 
         sq = jnp.square(v_t - u_t)
         flow_delay_metrics = {}
+        flow_required = None
         if self.flow_config is not None:
             # Missing flow_delay is the backwards-compatible synchronous value d_flow=0.
             flow_delay = (
@@ -452,11 +453,17 @@ class Pi0(_model.BaseModel):
                 else jnp.asarray(observation.vlm_delay, dtype=jnp.float32)
             )
             vlm_delay = jnp.clip(vlm_delay, 0, self.flow_config.vlm_delay_max)
+            flow_required = (
+                jnp.zeros(observation.state.shape[:-1], dtype=jnp.bool_)
+                if observation.flow_required is None
+                else jnp.asarray(observation.flow_required, dtype=jnp.bool_)
+            )
             flow_delay_metrics = {
                 "mean_flow_delay": jnp.mean(flow_delay),
                 "frac_flow_delay_0": jnp.mean((flow_delay == 0).astype(jnp.float32)),
                 "mean_vlm_delay": jnp.mean(vlm_delay),
                 "frac_vlm_delay_max": jnp.mean((vlm_delay == self.flow_config.vlm_delay_max).astype(jnp.float32)),
+                "frac_flow_required": jnp.mean(flow_required.astype(jnp.float32)),
             }
         if self.flow_config is not None and self.pi05 and self.flow_config.use_pir2:
             # Renormalize valid positions so the outer mean matches the baseline π0.5 loss scale.
@@ -465,8 +472,33 @@ class Pi0(_model.BaseModel):
             return loss, {
                 **self._flow_loss_metrics(loss, sq, is_pir2, tau, loss_mask, flow_stats),
                 **flow_delay_metrics,
+                **self._flow_required_loss_metrics(loss, flow_required),
             }
-        return jnp.mean(sq, axis=-1), flow_delay_metrics
+        loss = jnp.mean(sq, axis=-1)
+        if self.flow_config is not None:
+            flow_delay_metrics = {
+                **flow_delay_metrics,
+                **self._flow_required_loss_metrics(loss, flow_required),
+            }
+        return loss, flow_delay_metrics
+
+    def _flow_required_loss_metrics(
+        self, loss: at.Float[at.Array, "*b ah"], flow_required: at.Bool[at.Array, "*b"] | None
+    ) -> dict[str, at.Array]:
+        """Splits the per-example action loss by the explicit forced-stale sample mask."""
+        if flow_required is None:
+            flow_required = jnp.zeros(loss.shape[:-1], dtype=jnp.bool_)
+        flow_required = jnp.asarray(flow_required, dtype=jnp.bool_)
+        row_loss = jnp.mean(loss.astype(jnp.float32), axis=-1)
+
+        def masked_row_mean(mask: jax.Array) -> jax.Array:
+            mask_f = mask.astype(jnp.float32)
+            return jnp.sum(row_loss * mask_f) / (jnp.sum(mask_f) + 1e-8)
+
+        return {
+            "loss_flow_required": masked_row_mean(flow_required),
+            "loss_normal": masked_row_mean(~flow_required),
+        }
 
     def _flow_loss_metrics(
         self,

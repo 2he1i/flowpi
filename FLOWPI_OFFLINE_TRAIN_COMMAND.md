@@ -85,7 +85,9 @@ bash scripts/train_flowpi_flow_required_8xh200.sh
 `logs/flowpi_cache_train/flowpi_8xh200_flow_required/`，新的 checkpoint 位于
 `checkpoints/flowpi_aloha/flowpi_8xh200_flow_required/`。比较时重点看每个 run 的
 `mean_vlm_delay`、`flow_gate_tanh_abs_layer*`、`flow_ca_residual_ratio_layer*`、loss，以及
-同一步的 checkpoint。
+`frac_flow_required`、`loss_flow_required`、`loss_normal` 和同一步的 checkpoint。
+这里的 `FLOWPI_FLOW_REQUIRED_PROB=0.5` 表示 eligible 样本中的 forced-stale augmentation 比例，
+不是整个 batch 中所有 stale VLM 样本的总比例。
 
 监控新 run：
 

@@ -124,17 +124,31 @@ def test_flow_required_sampling_forces_stale_vlm_prefix_without_crossing_episode
         }
         out = transform({"images": images, "episode_index": 0, "frame_index": current})
         assert 3 <= out["vlm_delay"] <= 4
+        assert bool(out["flow_required"])
         np.testing.assert_array_equal(out["images"][_CAM], images[_CAM][frame_offsets.index(-out["vlm_delay"])])
 
-    # At episode tick 1, only delays 0 and 1 are reachable. The forced lower bound is clamped to 1,
-    # so the transform must select the current episode's first frame, never a previous episode frame.
+    # At episode tick 1, the minimum forced delay is not reachable. The sample is therefore normal,
+    # and the transform must never label it required or read a previous episode frame.
     current = 1
     images = {
         _CAM: np.stack([np.full((3, 2, 2), current + offset, dtype=np.uint8) for offset in frame_offsets], axis=0)
     }
     out = transform({"images": images, "episode_index": 1, "frame_index": current})
-    assert out["vlm_delay"] == 1
-    np.testing.assert_array_equal(out["images"][_CAM], images[_CAM][frame_offsets.index(-1)])
+    assert not bool(out["flow_required"])
+    assert 0 <= out["vlm_delay"] <= 1
+    np.testing.assert_array_equal(out["images"][_CAM], images[_CAM][frame_offsets.index(-out["vlm_delay"])])
+
+
+def test_flow_required_mask_defaults_false_without_history():
+    transform = _transforms.DelaySlowImage(
+        4,
+        (0,),
+        flow_required_prob=1.0,
+        flow_required_vlm_delay_min=3,
+    )
+    out = transform({"images": {_CAM: np.zeros((3, 2, 2), dtype=np.uint8)}, "frame_index": 8})
+    assert out["vlm_delay"] == 0
+    assert not bool(out["flow_required"])
 
 
 def test_online_flow_uses_stale_target_but_keeps_internal_stride():

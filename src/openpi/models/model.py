@@ -70,6 +70,7 @@ IMAGE_RESOLUTION = (224, 224)
 #     "token_loss_mask": bool[*b, l],  # Optional, loss mask for FAST model
 #     "vlm_delay": int32[*b],  # Optional, age of the slow VLM prefix
 #     "flow_delay": int32[*b],  # Optional, age of the cached flow target tick
+#     "flow_required": bool[*b],  # Optional, eligible forced-stale VLM sample mask
 #
 #      # Actions data.
 #      "actions": float32[*b ah ad]
@@ -118,6 +119,8 @@ class Observation(Generic[ArrayT]):
     vlm_delay: at.Int[ArrayT, "*b"] | None = None
     # Flow-channel age (ticks between the current action tick and the flow target tick), int [*b].
     flow_delay: at.Int[ArrayT, "*b"] | None = None
+    # Whether this sample was selected for the eligible forced-stale VLM-prefix subset, bool [*b].
+    flow_required: at.Bool[ArrayT, "*b"] | None = None
 
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
@@ -143,6 +146,7 @@ class Observation(Generic[ArrayT]):
             flow_masks=data.get("flow_masks"),
             vlm_delay=data.get("vlm_delay"),
             flow_delay=data.get("flow_delay"),
+            flow_required=data.get("flow_required"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -234,6 +238,7 @@ def preprocess_observation(
         flow_masks=observation.flow_masks,
         vlm_delay=observation.vlm_delay,
         flow_delay=observation.flow_delay,
+        flow_required=observation.flow_required,
     )
 
 

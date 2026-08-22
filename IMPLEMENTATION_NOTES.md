@@ -125,6 +125,14 @@ subset of samples, while the cached Flow branch remains a real historical observ
 own independently sampled age. It does not add a Flow reconstruction loss, alter πR², or change
 the internal `K × stride` meaning of a cache row. The comparison run uses a separate log and
 checkpoint namespace, leaving the original `flowpi_8xh200` and its step-2000 checkpoint intact.
+The configured `p=0.5` is the forced-stale augmentation probability among eligible samples; the
+remaining samples still use the original delay distribution and can also be stale by chance.
+
+The transform records an explicit `flow_required` boolean only for eligible samples whose
+`frame_index >= flow_required_vlm_delay_min`; episode-start samples below that threshold remain
+normal samples and are never mislabeled as forced-stale. Training telemetry reports
+`frac_flow_required`, `loss_flow_required`, and `loss_normal` so the experiment can distinguish
+performance on the forced-stale subset from the rest of the batch.
 
 Training simulates asynchronous channel freshness by selecting historical cached observations.
 Future online runtime will replace this sampling with actual worker completion timestamps while

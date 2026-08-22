@@ -264,6 +264,9 @@ class Pi0Config(_model.BaseModelConfig):
                 flow_delay=(
                     jax.ShapeDtypeStruct([batch_size], jnp.int32) if flow is not None and flow.enabled else None
                 ),
+                flow_required=(
+                    jax.ShapeDtypeStruct([batch_size], jnp.bool_) if flow is not None and flow.enabled else None
+                ),
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 

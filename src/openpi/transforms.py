@@ -733,9 +733,11 @@ class DelaySlowImage(DataTransformFn):
     further back than the episode start).
 
     ``flow_required_prob`` implements the Flow-required/slow-prefix-dropout recipe: on that
-    fraction of samples, the VLM delay is sampled only from ``flow_required_vlm_delay_min`` to
-    ``vlm_delay_max``. The Flow channel itself remains independently sampled by LoadFlowCache or
-    ComputeFlow; this transform only weakens the competing slow prefix.
+    fraction of eligible samples (``frame_index >= flow_required_vlm_delay_min``), the VLM delay
+    is sampled only from ``flow_required_vlm_delay_min`` to ``vlm_delay_max``. The transform keeps
+    the event in ``data["flow_required"]`` for telemetry. The Flow channel itself remains
+    independently sampled by LoadFlowCache or ComputeFlow; this transform only weakens the
+    competing slow prefix.
     """
 
     def __init__(
@@ -780,12 +782,14 @@ class DelaySlowImage(DataTransformFn):
         stacked = next(iter(images.values()), None)
         if stacked is None or np.asarray(stacked).ndim != 4:
             data["vlm_delay"] = 0
+            data["flow_required"] = False
             return data
 
         frame_index = int(np.asarray(data["frame_index"]).item())
         rng = _delay_rng(self.seed, _worker_id(), self._calls, stream_id=0)
         self._calls += 1
-        required = self.flow_required_prob > 0.0 and rng.random() < self.flow_required_prob
+        eligible = frame_index >= self.flow_required_vlm_delay_min
+        required = eligible and self.flow_required_prob > 0.0 and rng.random() < self.flow_required_prob
         d_vlm = _sample_reachable_delay(
             rng,
             frame_index,
@@ -797,6 +801,7 @@ class DelaySlowImage(DataTransformFn):
         idx = frame_offset_index(self.frame_offsets, -d_vlm) if d_vlm > 0 else frame_offset_index(self.frame_offsets, 0)
         data["images"] = {cam: np.asarray(stack)[idx] for cam, stack in images.items()}
         data["vlm_delay"] = d_vlm
+        data["flow_required"] = required
         return data
 
 

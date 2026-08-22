@@ -375,6 +375,7 @@ def _render(snapshot: TrainingSnapshot) -> str:
             f"Loss:     {_format_number(snapshot.metrics.get('loss'))}    grad_norm={_format_number(snapshot.metrics.get('grad_norm'))}    param_norm={_format_number(snapshot.metrics.get('param_norm'), 2)}",
             f"Flow:     mean_delay={_format_number(snapshot.metrics.get('mean_flow_delay'), 3)}    frac_delay_0={_format_number(snapshot.metrics.get('frac_flow_delay_0'), 3)}    age_emb_norm={_format_number(snapshot.metrics.get('flow_age_emb_norm'), 4)}",
             f"VLM:      mean_delay={_format_number(snapshot.metrics.get('mean_vlm_delay'), 3)}    frac_delay_max={_format_number(snapshot.metrics.get('frac_vlm_delay_max'), 3)}",
+            f"Flow req: frac={_format_number(snapshot.metrics.get('frac_flow_required'), 3)}    loss_required={_format_number(snapshot.metrics.get('loss_flow_required'), 6)}    loss_normal={_format_number(snapshot.metrics.get('loss_normal'), 6)}",
             f"Flow CA:  gate={_format_number(snapshot.metrics.get('flow_gate_tanh_abs_layer7'), 4)}/{_format_number(snapshot.metrics.get('flow_gate_tanh_abs_layer12'), 4)}/{_format_number(snapshot.metrics.get('flow_gate_tanh_abs_layer16'), 4)}    residual={_format_number(snapshot.metrics.get('flow_ca_residual_ratio_layer7'), 6)}/{_format_number(snapshot.metrics.get('flow_ca_residual_ratio_layer12'), 6)}/{_format_number(snapshot.metrics.get('flow_ca_residual_ratio_layer16'), 6)}",
             f"πR²:      frac_pir2={_format_number(snapshot.metrics.get('frac_pir2'), 3)}",
         ]

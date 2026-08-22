@@ -668,6 +668,8 @@ class TrainConfig:
     overwrite: bool = False
     # If true, will resume training from the last checkpoint.
     resume: bool = False
+    # Optional checkpoint step to restore instead of the latest available step.
+    resume_step: int | None = None
 
     # If true, will enable wandb logging.
     wandb_enabled: bool = True
@@ -701,6 +703,11 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if self.resume_step is not None:
+            if self.resume_step < 0:
+                raise ValueError(f"resume_step must be non-negative, got {self.resume_step}")
+            if not self.resume:
+                raise ValueError("resume_step requires resume=True")
 
 
 def _flowpi_ablation_configs() -> tuple[TrainConfig, ...]:

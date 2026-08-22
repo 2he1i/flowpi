@@ -15,6 +15,7 @@
 #   FLOWPI_FLOW_CACHE_DIR=/shared/flowpi_data/flow_cache \
 #   FLOWPI_FLOW_DELAY_DISTRIBUTION="1 1 1 1" \
 #   FLOWPI_SEA_RAFT_CKPT=/shared/models/robot_sea_raft_m.pth \
+#   FLOWPI_RESUME_STEP=15000 \
 #   FLOWPI_LOG_ROOT=/shared/flowpi_logs \
 #   bash scripts/train_flowpi_8xh200.sh
 #
@@ -100,6 +101,7 @@ ASSET_ID="$(env_or FLOWPI_ASSET_ID flowpi_data/train_dataset)"
 WEIGHT_LOADER_PATH="$(env_or FLOWPI_WEIGHT_LOADER_PATH gs://openpi-assets/checkpoints/pi05_base/params)"
 RESUME="$(env_or FLOWPI_RESUME 1)"
 OVERWRITE="$(env_or FLOWPI_OVERWRITE 0)"
+RESUME_STEP="$(env_or FLOWPI_RESUME_STEP "")"
 WANDB_ENABLED="$(env_or FLOWPI_WANDB_ENABLED 0)"
 
 [[ "$EXPECTED_GPUS" =~ ^[1-9][0-9]*$ ]] || die "FLOWPI_EXPECTED_GPUS must be a positive integer"
@@ -116,6 +118,10 @@ esac
 [[ "$OVERWRITE" == 0 || "$OVERWRITE" == 1 ]] || die "FLOWPI_OVERWRITE must be 0 or 1"
 [[ "$WANDB_ENABLED" == 0 || "$WANDB_ENABLED" == 1 ]] || die "FLOWPI_WANDB_ENABLED must be 0 or 1"
 [[ "$RESUME:$OVERWRITE" != 1:1 ]] || die "Resume and overwrite cannot both be enabled"
+if [[ -n "$RESUME_STEP" ]]; then
+    [[ "$RESUME_STEP" =~ ^[0-9]+$ ]] || die "FLOWPI_RESUME_STEP must be a non-negative integer"
+    [[ "$RESUME" == 1 ]] || die "FLOWPI_RESUME_STEP requires FLOWPI_RESUME=1"
+fi
 
 SEA_RAFT_CKPT_ARG=None
 if [[ -n "$SEA_RAFT_CKPT" ]]; then
@@ -144,6 +150,7 @@ log INFO "Flow: cache=$FLOW_CACHE_DIR, SEA-RAFT is offline"
 log INFO "SEA-RAFT provenance: ckpt=$SEA_RAFT_CKPT_ARG, variant=$SEA_RAFT_VARIANT, iters=$SEA_RAFT_ITERS"
 log INFO "Trainable: VLM language backbone + Action Expert + Flow modules; frozen: SigLIP vision tower"
 log INFO "Geometry: image geometric augmentation disabled to preserve raw-cache coordinates"
+log INFO "Resume: enabled=$RESUME, requested_step=${RESUME_STEP:-latest}"
 log INFO "Checkpoint directory: $CHECKPOINT_DIR"
 
 # ----------------------------- accelerator/runtime -----------------------------
@@ -229,6 +236,7 @@ fi
     printf 'vlm_delay_max=%s\n' "$VLM_DELAY_MAX"
     printf 'num_workers=%s\n' "$NUM_WORKERS"
     printf 'resume=%s\n' "$RESUME"
+    printf 'resume_step=%s\n' "${RESUME_STEP:-latest}"
     printf 'overwrite=%s\n' "$OVERWRITE"
     printf 'wandb_enabled=%s\n' "$WANDB_ENABLED"
     printf 'dataset_root=%s\n' "$DATASET_ROOT"
@@ -288,6 +296,12 @@ else
     OVERWRITE_FLAG=--no-overwrite
 fi
 
+if [[ -n "$RESUME_STEP" ]]; then
+    RESUME_STEP_ARGS=(--resume-step "$RESUME_STEP")
+else
+    RESUME_STEP_ARGS=()
+fi
+
 write_command_log() {
     if [[ "$PYTHON_MODE" == uv ]]; then
         printf 'uv run python '
@@ -328,7 +342,7 @@ write_command_log() {
         --data.flow.sea-raft-device cpu \
         --data.flow.load-flow-cache --data.flow.sample-vlm-delay \
         --weight-loader.params-path "$WEIGHT_LOADER_PATH" \
-        "$WANDB_FLAG" "$RESUME_FLAG" "$OVERWRITE_FLAG"
+        "$WANDB_FLAG" "$RESUME_FLAG" "$OVERWRITE_FLAG" "${RESUME_STEP_ARGS[@]}"
     printf '%s\n' ""
 }
 
@@ -448,7 +462,7 @@ run_training() {
         --data.flow.load-flow-cache \
         --data.flow.sample-vlm-delay \
         --weight-loader.params-path "$WEIGHT_LOADER_PATH" \
-        "$WANDB_FLAG" "$RESUME_FLAG" "$OVERWRITE_FLAG"
+        "$WANDB_FLAG" "$RESUME_FLAG" "$OVERWRITE_FLAG" "${RESUME_STEP_ARGS[@]}"
 }
 
 # The training process writes only to the durable shared log. Heartbeat and GPU monitoring remain

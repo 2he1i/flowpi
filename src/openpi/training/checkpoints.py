@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures as futures
 import dataclasses
+import datetime
+import json
 import logging
 import pathlib
-from typing import Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from etils import epath
 import jax
@@ -18,6 +20,9 @@ from openpi.shared import array_typing as at
 import openpi.shared.normalize as _normalize
 import openpi.training.data_loader as _data_loader
 import openpi.training.utils as training_utils
+
+if TYPE_CHECKING:
+    import openpi.training.config as _config
 
 
 def initialize_checkpoint_dir(
@@ -44,6 +49,7 @@ def initialize_checkpoint_dir(
         checkpoint_dir,
         item_handlers={
             "assets": CallbackHandler(),
+            "config": ocp.JsonCheckpointHandler(),
             "train_state": ocp.PyTreeCheckpointHandler(),
             "params": ocp.PyTreeCheckpointHandler(),
         },
@@ -69,6 +75,7 @@ def save_state(
     checkpoint_manager: ocp.CheckpointManager,
     state: training_utils.TrainState,
     data_loader: _data_loader.DataLoader,
+    config: _config.TrainConfig,
     step: int,
 ):
     def save_assets(directory: epath.Path):
@@ -83,10 +90,38 @@ def save_state(
         train_state, params = _split_params(state)
     items = {
         "assets": save_assets,
+        "config": _training_config_metadata(config, step),
         "train_state": train_state,
         "params": {"params": params},
     }
     checkpoint_manager.save(step, items)
+
+
+def _training_config_metadata(config: _config.TrainConfig, step: int) -> dict[str, Any]:
+    """Return a JSON-compatible snapshot of the resolved training recipe."""
+    config_dict = json.loads(json.dumps(dataclasses.asdict(config), default=str))
+    return {
+        "schema_version": 1,
+        "saved_step": step,
+        "saved_at_utc": datetime.datetime.now(datetime.UTC).isoformat(),
+        "training": {
+            "batch_size": config.batch_size,
+            "num_train_steps": config.num_train_steps,
+            "num_workers": config.num_workers,
+            "seed": config.seed,
+            "ema_decay": config.ema_decay,
+            "fsdp_devices": config.fsdp_devices,
+            "log_interval": config.log_interval,
+            "save_interval": config.save_interval,
+            "keep_period": config.keep_period,
+            "resume_step": config.resume_step,
+        },
+        "lr_schedule_type": type(config.lr_schedule).__name__,
+        "lr_schedule": config_dict["lr_schedule"],
+        "optimizer_type": type(config.optimizer).__name__,
+        "optimizer": config_dict["optimizer"],
+        "config": config_dict,
+    }
 
 
 def restore_state(

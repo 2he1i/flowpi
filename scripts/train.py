@@ -247,6 +247,17 @@ def main(config: _config.TrainConfig):
         overwrite=config.overwrite,
         resume=config.resume,
     )
+    if config.resume_step is not None and not resuming:
+        raise ValueError(
+            f"Requested resume_step={config.resume_step}, but no restorable checkpoint exists in {config.checkpoint_dir}."
+        )
+    if resuming and config.resume_step is not None:
+        available_steps = tuple(int(step) for step in checkpoint_manager.all_steps())
+        if config.resume_step not in available_steps:
+            raise ValueError(
+                f"Requested resume_step={config.resume_step}, but available checkpoints are {available_steps}."
+            )
+        logging.info(f"Resuming explicitly from checkpoint step {config.resume_step}")
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
     data_loader = _data_loader.create_data_loader(
@@ -270,7 +281,7 @@ def main(config: _config.TrainConfig):
     logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
 
     if resuming:
-        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader, step=config.resume_step)
 
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
@@ -305,7 +316,7 @@ def main(config: _config.TrainConfig):
         if (
             completed_step % config.save_interval == 0 and completed_step > start_step
         ) or completed_step == config.num_train_steps:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, completed_step)
+            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, config, completed_step)
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()

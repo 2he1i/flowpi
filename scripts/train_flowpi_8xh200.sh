@@ -46,6 +46,7 @@ env_or() {
 
 CONFIG_NAME="$(env_or FLOWPI_CONFIG_NAME flowpi_aloha)"
 EXP_NAME="$(env_or FLOWPI_EXP_NAME flowpi_8xh200)"
+LAUNCHER_LABEL="$(env_or FLOWPI_LAUNCHER_LABEL 8xH200)"
 RUN_ID="$(env_or FLOWPI_RUN_ID "$(date -u +%Y%m%dT%H%M%SZ)")"
 LOG_ROOT="$(env_or FLOWPI_LOG_ROOT "$REPO_ROOT/logs/flowpi_8xh200")"
 RUN_DIR="$(env_or FLOWPI_RUN_DIR "$LOG_ROOT/$EXP_NAME/$RUN_ID")"
@@ -69,7 +70,7 @@ die() {
     exit 1
 }
 
-log INFO "FlowPI 8xH200 launcher started. repo=$REPO_ROOT"
+log INFO "FlowPI $LAUNCHER_LABEL launcher started. repo=$REPO_ROOT"
 log INFO "Run directory: $RUN_DIR"
 log INFO "Main log: $RUN_LOG"
 

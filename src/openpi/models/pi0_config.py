@@ -299,11 +299,16 @@ class Pi0Config(_model.BaseModelConfig):
             filters.append(
                 nnx.Not(nnx_utils.PathRegex(".*lora.*")),
             )
+
+        # Freeze SigLIP independently of the language/LoRA policy. In particular, the LoRA
+        # branch above may already have filters, so this must not be hidden behind the
+        # no-LoRA case. This keeps a VLM-LoRA + full Action Expert recipe from accidentally
+        # training the vision tower.
+        if self.freeze_vision_encoder:
+            filters.append(nnx_utils.PathRegex("PaliGemma/img.*"))
+
         if not filters:
-            # With no LoRA the upstream default is to train everything. The flowpi frozen-vision
-            # policy opts in via `freeze_vision_encoder` (flowpi additionally keeps SEA-RAFT
-            # frozen outside the JAX parameter tree).
-            if self.freeze_vision_encoder:
-                return nnx_utils.PathRegex("PaliGemma/img.*")
+            # With no LoRA and no frozen vision tower the upstream default is to train everything.
+            # FlowPI keeps SEA-RAFT frozen outside the JAX parameter tree.
             return nnx.Nothing
         return nnx.All(*filters)

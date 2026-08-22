@@ -1346,6 +1346,62 @@ _CONFIGS = [
         num_train_steps=20_000,
         batch_size=32,
     ),
+    TrainConfig(
+        # Memory-aware FlowPI recipe for eight 24 GB RTX 4090 GPUs. Only the PaliGemma VLM
+        # language backbone uses LoRA; the Action Expert and all FlowPI modules remain full
+        # parameter trainable, while SigLIP is frozen.
+        name="flowpi_aloha_8x4090_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m",
+            flow=pi0_config.FlowConfig(),
+            freeze_vision_encoder=True,
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="flowpi_data/train_dataset",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(
+                assets_dir="assets/flowpi_aloha",
+                asset_id="flowpi_data/train_dataset",
+            ),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            flow=FlowDataConfig(
+                mode="cache",
+                flow_cache_dir="flowpi_data/flow_cache",
+                sea_raft_ckpt="<your-sea-raft-ckpt>",
+                sea_raft_device="cuda",
+            ),
+        ),
+        weight_loader=weight_loaders.FlowPiWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m",
+            flow=pi0_config.FlowConfig(),
+            freeze_vision_encoder=True,
+        ).get_freeze_filter(),
+        num_train_steps=30_000,
+        batch_size=32,
+        ema_decay=None,
+    ),
     #
     # flowpi ablation configs A-E. Every variant shares the flowpi_aloha training recipe: the
     # same pretrained checkpoint (π0.5 base via FlowPiWeightLoader; the flowpi modules are

@@ -221,6 +221,7 @@ write_cache_command() {
     local -a args=(
         scripts/precompute_flow_cache.py
         "$CONFIG_NAME"
+        --exp-name "$EXP_NAME"
         --data.repo-id "$DATASET_ROOT"
         --data.flow.flow-cache-dir "$FLOW_CACHE_DIR"
         --data.flow.sea-raft-ckpt "$SEA_RAFT_CKPT"
@@ -254,6 +255,7 @@ run_cache() {
     local -a args=(
         scripts/precompute_flow_cache.py
         "$CONFIG_NAME"
+        --exp-name "$EXP_NAME"
         --data.repo-id "$DATASET_ROOT"
         --data.flow.flow-cache-dir "$FLOW_CACHE_DIR"
         --data.flow.sea-raft-ckpt "$SEA_RAFT_CKPT"

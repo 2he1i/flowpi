@@ -47,6 +47,20 @@ def checkpoint_sha256(path: str | pathlib.Path | None) -> str | None:
     return digest.hexdigest()
 
 
+def _extract_model_state_dict(checkpoint: object) -> dict:
+    """Extract model weights from raw SEA-RAFT or training-wrapper checkpoints."""
+    if not isinstance(checkpoint, dict):
+        raise TypeError(f"Expected a checkpoint dictionary, got {type(checkpoint).__name__}")
+
+    for key in ("state_dict", "model_state_dict"):
+        weights = checkpoint.get(key)
+        if isinstance(weights, dict):
+            return weights
+
+    # Official SEA-RAFT checkpoints are saved as the raw model state dict.
+    return checkpoint
+
+
 def _make_raft_args(dim: int, iters: int, radius: int, block_dims: list[int]):
     # SEA-RAFT's RAFT constructor mutates the args namespace (e.g. `args.corr_levels = 4`), so we
     # use a plain namespace instead of a frozen dataclass.
@@ -135,9 +149,8 @@ class SeaRaftFlowExtractor:
             p.requires_grad = False
 
         if ckpt_path is not None:
-            state_dict = torch.load(str(ckpt_path), map_location=self._device)
-            if "state_dict" in state_dict:
-                state_dict = state_dict["state_dict"]
+            checkpoint = torch.load(str(ckpt_path), map_location=self._device)
+            state_dict = _extract_model_state_dict(checkpoint)
             self._model.load_state_dict(state_dict, strict=True)
 
     @torch.no_grad()

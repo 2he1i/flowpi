@@ -90,7 +90,7 @@ die() {
     exit 1
 }
 
-EXPECTED_CACHE_CKPT="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/zheli/SEA-RAFT-FT/SEA-RAFT/checkpoints/robot-ft-M-4gpu-shadow-15k-to-25k_robot-ft-M-4gpu-shadow-15k-to-25k-20260822-053345.pth"
+EXPECTED_CACHE_CKPT="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/zheli/SEA-RAFT-FT/SEA-RAFT/checkpoints/24000_robot-ft-M-4gpu-shadow-15k-to-25k_robot-ft-M-4gpu-shadow-15k-to-25k-20260822-053345.pth"
 SEA_RAFT_CKPT="$(env_or FLOWPI_SEA_RAFT_CKPT "$EXPECTED_CACHE_CKPT")"
 SEA_RAFT_VARIANT="$(env_or FLOWPI_SEA_RAFT_VARIANT M)"
 SEA_RAFT_ITERS="$(env_or FLOWPI_SEA_RAFT_ITERS 4)"

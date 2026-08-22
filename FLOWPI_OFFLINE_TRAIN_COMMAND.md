@@ -96,3 +96,26 @@ cd /inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/zheli/DOMINO/p
 .venv/bin/python scripts/monitor_flowpi_training.py \
   --run-root logs/flowpi_cache_train/flowpi_8xh200_flow_required --refresh 30
 ```
+
+## 当前直接运行命令（每 2000 steps 保存 checkpoint）
+
+```bash
+cd /inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/zheli/DOMINO/policy/flowpi && \
+OPENPI_DATA_HOME=/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/zheli/DOMINO/policy/pi05/offline_assets/openpi_cache \
+FLOWPI_WEIGHT_LOADER_PATH=/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/zheli/DOMINO/policy/pi05/offline_assets/openpi_cache/openpi-assets/checkpoints/pi05_base/params \
+JAX_PLATFORMS=cuda \
+FLOWPI_XLA_MEM_FRACTION=0.98 \
+FLOWPI_SAVE_INTERVAL=2000 \
+FLOWPI_EXP_NAME=flowpi_8xh200_flow_required \
+FLOWPI_LOG_ROOT=/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/zheli/DOMINO/policy/flowpi/logs/flowpi_cache_train \
+FLOWPI_FLOW_REQUIRED_PROB=0.5 \
+FLOWPI_FLOW_REQUIRED_VLM_DELAY_MIN=5 \
+FLOWPI_FLOW_GATE_INIT=0.01 \
+FLOWPI_RESUME=0 \
+FLOWPI_SEA_RAFT_CKPT=/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/zheli/SEA-RAFT-FT/SEA-RAFT/checkpoints/24000_robot-ft-M-4gpu-shadow-15k-to-25k_robot-ft-M-4gpu-shadow-15k-to-25k-20260822-053345.pth \
+FLOWPI_TRAIN_CUDA_DEVICES=0,1,2,3,4,5,6,7 \
+FLOWPI_TRAIN_EXPECTED_GPUS=8 \
+FLOWPI_GLOBAL_BATCH=128 \
+FLOWPI_WANDB_ENABLED=0 \
+bash scripts/train_flowpi_flow_required_8xh200.sh
+```

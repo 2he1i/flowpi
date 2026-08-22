@@ -72,7 +72,7 @@ log INFO "Main log: $RUN_LOG"
 # ------------------------------- training recipe -------------------------------
 
 EXPECTED_GPUS="$(env_or FLOWPI_EXPECTED_GPUS 8)"
-GLOBAL_BATCH="$(env_or FLOWPI_GLOBAL_BATCH 256)"
+GLOBAL_BATCH="$(env_or FLOWPI_GLOBAL_BATCH 128)"
 NUM_STEPS="$(env_or FLOWPI_NUM_STEPS 30000)"
 WARMUP_STEPS="$(env_or FLOWPI_WARMUP_STEPS 1000)"
 PEAK_LR="$(env_or FLOWPI_PEAK_LR 5e-5)"

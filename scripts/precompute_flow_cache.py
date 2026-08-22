@@ -18,13 +18,14 @@ their own row range and multi-file datasets stay aligned with the training loade
 
 Usage:
   uv run python scripts/precompute_flow_cache.py flowpi_aloha \
-      [--data.flow.sea-raft-ckpt /path/to/sea_raft.pth] [--max-frames 20] [--num-workers 4]
+      [--data.flow.sea-raft-ckpt /path/to/sea_raft.pth] [--devices 0,1,2,3] [--max-frames 20]
 """
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor
 import dataclasses
 import json
+import multiprocessing
 import pathlib
 
 import numpy as np
@@ -36,6 +37,12 @@ def _parse_args():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument(
+        "--devices",
+        type=str,
+        default=None,
+        help="Comma-separated logical CUDA device ids. Starts one fixed worker per device.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     known, remaining = parser.parse_known_args()
     import openpi.training.config as _config
@@ -72,18 +79,24 @@ def _create_precompute_data_config(train_config):
     return data_factory.create(train_config.assets_dirs, train_config.model)
 
 
-def _process_episode(task: dict) -> dict:
-    """Worker: computes and saves the flow cache for one episode."""
-    from openpi.training.lerobot_v3_dataset import LeRobotV3ParquetDataset
+def _make_extractor(task: dict):
     from openpi.training.sea_raft import SeaRaftFlowExtractor
 
-    extractor = SeaRaftFlowExtractor(
+    return SeaRaftFlowExtractor(
         ckpt_path=task["sea_raft_ckpt"] or None,
         variant=task.get("sea_raft_variant", "M"),
         iters=task.get("sea_raft_iters"),
         device=task["sea_raft_device"],
         allow_random_init=task.get("sea_raft_allow_random_init", False),
     )
+
+
+def _process_episode(task: dict, extractor=None) -> dict:
+    """Worker: computes and saves the flow cache for one episode."""
+    from openpi.training.lerobot_v3_dataset import LeRobotV3ParquetDataset
+
+    if extractor is None:
+        extractor = _make_extractor(task)
     root = pathlib.Path(task["root"])
     entry = task["entry"]
     k_num, stride, batch_size = task["num_flow_steps"], task["flow_stride_frames"], task["batch_size"]
@@ -154,6 +167,41 @@ def _process_episode(task: dict) -> dict:
         "num_pairs": len(pairs),
         "image_size": [height, width],
     }
+
+
+def _process_device(task_group: list[dict]) -> list[dict]:
+    """Process all episodes assigned to one fixed CUDA device in one subprocess."""
+    if not task_group:
+        return []
+    extractor = _make_extractor(task_group[0])
+    print(f"Processing {len(task_group)} episode(s) on {task_group[0]['sea_raft_device']}", flush=True)
+    return [_process_episode(task, extractor=extractor) for task in task_group]
+
+
+def _parse_devices(spec: str) -> list[str]:
+    """Parse logical CUDA ids, which are relative to CUDA_VISIBLE_DEVICES."""
+    devices = []
+    for raw_device in spec.split(","):
+        device = raw_device.strip()
+        if device.startswith("cuda:"):
+            device = device.removeprefix("cuda:")
+        if not device.isdigit():
+            raise ValueError(f"Invalid CUDA device id {raw_device!r}; expected values like 0,1,2,3.")
+        devices.append(f"cuda:{int(device)}")
+    if not devices or len(set(devices)) != len(devices):
+        raise ValueError(f"--devices must contain unique CUDA ids, got {spec!r}")
+    return devices
+
+
+def _partition_tasks(tasks: list[dict], devices: list[str]) -> list[list[dict]]:
+    """Balance episodes by frame count and pin each group to one logical CUDA device."""
+    groups = [[] for _ in devices]
+    frame_loads = [0] * len(devices)
+    for task in sorted(tasks, key=lambda item: item["entry"]["length"], reverse=True):
+        group_index = min(range(len(groups)), key=frame_loads.__getitem__)
+        groups[group_index].append({**task, "sea_raft_device": devices[group_index]})
+        frame_loads[group_index] += task["entry"]["length"]
+    return [group for group in groups if group]
 
 
 def main():
@@ -228,10 +276,25 @@ def main():
         for entry in entries
     ]
 
-    if extra.num_workers <= 1:
+    if extra.devices is not None:
+        devices = _parse_devices(extra.devices)
+        if flow_cfg.sea_raft_device != "cuda":
+            raise ValueError("--devices requires --data.flow.sea-raft-device=cuda")
+        if extra.num_workers not in (0, len(devices)):
+            raise ValueError(
+                f"With --devices, --num-workers must be omitted or equal the device count ({len(devices)}), "
+                f"got {extra.num_workers}."
+            )
+        task_groups = _partition_tasks(tasks, devices)
+        context = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=len(task_groups), mp_context=context) as pool:
+            grouped_results = list(pool.map(_process_device, task_groups))
+        results = [result for group in grouped_results for result in group]
+    elif extra.num_workers <= 1:
         results = [_process_episode(task) for task in tasks]
     else:
-        with ProcessPoolExecutor(max_workers=extra.num_workers) as pool:
+        context = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=extra.num_workers, mp_context=context) as pool:
             results = list(pool.map(_process_episode, tasks))
 
     from openpi.training.sea_raft import checkpoint_sha256

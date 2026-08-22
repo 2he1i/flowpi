@@ -2,6 +2,14 @@ diff --git a/core/raft.py b/core/raft.py
 index 4c8d92f..0d37681 100644
 --- a/core/raft.py
 +++ b/core/raft.py
+@@ -31 +31,3 @@
+-        self.cnet = ResNetFPN(args, input_dim=6, output_dim=2 * self.args.dim, norm_layer=nn.BatchNorm2d, init_weight=True)
++        # The fine-tuned FlowPI checkpoint contains the complete feature extractors; avoid
++        # downloading torchvision's ImageNet initialization before loading that checkpoint.
++        self.cnet = ResNetFPN(args, input_dim=6, output_dim=2 * self.args.dim, norm_layer=nn.BatchNorm2d, init_weight=False)
+@@ -48 +50 @@
+-            self.fnet = ResNetFPN(args, input_dim=3, output_dim=self.output_dim, norm_layer=nn.BatchNorm2d, init_weight=True)
++            self.fnet = ResNetFPN(args, input_dim=3, output_dim=self.output_dim, norm_layer=nn.BatchNorm2d, init_weight=False)
 @@ -76 +76 @@ class RAFT(
 -    def forward(self, image1, image2, iters=None, flow_gt=None, test_mode=False):
 +    def forward(self, image1, image2, iters=None, flow_gt=None, test_mode=False, return_low_res=False):

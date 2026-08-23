@@ -91,6 +91,7 @@ FLOW_REQUIRED_VLM_DELAY_MIN="$(env_or FLOWPI_FLOW_REQUIRED_VLM_DELAY_MIN 0)"
 FLOW_GATE_INIT="$(env_or FLOWPI_FLOW_GATE_INIT 0.0)"
 NUM_WORKERS="$(env_or FLOWPI_NUM_WORKERS 8)"
 LOG_INTERVAL="$(env_or FLOWPI_LOG_INTERVAL 10)"
+TELEMETRY_EMA_STEPS="$(env_or FLOWPI_TELEMETRY_EMA_STEPS 500)"
 SAVE_INTERVAL="$(env_or FLOWPI_SAVE_INTERVAL 2000)"
 KEEP_PERIOD="$(env_or FLOWPI_KEEP_PERIOD 5000)"
 HEARTBEAT_INTERVAL="$(env_or FLOWPI_HEARTBEAT_INTERVAL 60)"
@@ -125,6 +126,10 @@ WANDB_ENABLED="$(env_or FLOWPI_WANDB_ENABLED 0)"
     "FLOWPI_FLOW_REQUIRED_VLM_DELAY_MIN must be a non-negative integer"
 (( FLOW_REQUIRED_VLM_DELAY_MIN <= VLM_DELAY_MAX )) || die \
     "FLOWPI_FLOW_REQUIRED_VLM_DELAY_MIN must be <= FLOWPI_VLM_DELAY_MAX"
+[[ "$TELEMETRY_EMA_STEPS" =~ ^[0-9]+$ ]] || die \
+    "FLOWPI_TELEMETRY_EMA_STEPS must be an integer in [100, 500]"
+(( TELEMETRY_EMA_STEPS >= 100 && TELEMETRY_EMA_STEPS <= 500 )) || die \
+    "FLOWPI_TELEMETRY_EMA_STEPS must be in [100, 500]"
 [[ "$FLOW_GATE_INIT" =~ ^0(\.[0-9]+)?$ ]] || die \
     "FLOWPI_FLOW_GATE_INIT must be in [0, 1), got: $FLOW_GATE_INIT"
 [[ "$SEA_RAFT_ITERS" =~ ^[1-9][0-9]*$ ]] || die "FLOWPI_SEA_RAFT_ITERS must be a positive integer"
@@ -166,6 +171,7 @@ log INFO "Schedule: steps=$NUM_STEPS, warmup=$WARMUP_STEPS, peak_lr=$PEAK_LR, en
 log INFO "Optimizer: AdamW, grad_clip=$GRAD_CLIP, ema=$EMA_DECAY, fsdp_devices=1"
 log INFO "Delays: flow=0..$FLOW_DELAY_MAX, VLM=0..$VLM_DELAY_MAX, sampled independently"
 log INFO "Flow-required slow-prefix dropout: probability=$FLOW_REQUIRED_PROB, VLM delay min=$FLOW_REQUIRED_VLM_DELAY_MIN"
+log INFO "Flow residual telemetry EMA window: $TELEMETRY_EMA_STEPS steps"
 log INFO "Flow gate initialization: target abs(tanh(gate))=$FLOW_GATE_INIT"
 log INFO "Flow: cache=$FLOW_CACHE_DIR, SEA-RAFT is offline"
 log INFO "SEA-RAFT provenance: ckpt=$SEA_RAFT_CKPT_ARG, variant=$SEA_RAFT_VARIANT, iters=$SEA_RAFT_ITERS"
@@ -261,6 +267,7 @@ fi
     printf 'flow_required_vlm_delay_min=%s\n' "$FLOW_REQUIRED_VLM_DELAY_MIN"
     printf 'flow_gate_init=%s\n' "$FLOW_GATE_INIT"
     printf 'num_workers=%s\n' "$NUM_WORKERS"
+    printf 'telemetry_ema_steps=%s\n' "$TELEMETRY_EMA_STEPS"
     printf 'resume=%s\n' "$RESUME"
     printf 'resume_step=%s\n' "${RESUME_STEP:-latest}"
     printf 'overwrite=%s\n' "$OVERWRITE"
@@ -342,6 +349,7 @@ write_command_log() {
         --num-train-steps "$NUM_STEPS" \
         --num-workers "$NUM_WORKERS" \
         --log-interval "$LOG_INTERVAL" \
+        --telemetry-ema-steps "$TELEMETRY_EMA_STEPS" \
         --save-interval "$SAVE_INTERVAL" \
         --keep-period "$KEEP_PERIOD" \
         --seed "$SEED" \
@@ -462,6 +470,7 @@ run_training() {
         --num-train-steps "$NUM_STEPS" \
         --num-workers "$NUM_WORKERS" \
         --log-interval "$LOG_INTERVAL" \
+        --telemetry-ema-steps "$TELEMETRY_EMA_STEPS" \
         --save-interval "$SAVE_INTERVAL" \
         --keep-period "$KEEP_PERIOD" \
         --seed "$SEED" \

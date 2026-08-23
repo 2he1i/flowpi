@@ -675,6 +675,8 @@ class TrainConfig:
 
     # How often (in steps) to log training metrics.
     log_interval: int = 100
+    # Effective window for the host-side Flow residual telemetry EMA.
+    telemetry_ema_steps: int = 500
     # How often (in steps) to save checkpoints.
     save_interval: int = 1000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
@@ -724,6 +726,8 @@ class TrainConfig:
                 raise ValueError(f"resume_step must be non-negative, got {self.resume_step}")
             if not self.resume:
                 raise ValueError("resume_step requires resume=True")
+        if not 100 <= self.telemetry_ema_steps <= 500:
+            raise ValueError(f"telemetry_ema_steps must be in [100, 500], got {self.telemetry_ema_steps}")
 
 
 def _flowpi_ablation_configs() -> tuple[TrainConfig, ...]:

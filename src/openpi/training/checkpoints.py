@@ -112,6 +112,7 @@ def _training_config_metadata(config: _config.TrainConfig, step: int) -> dict[st
             "ema_decay": config.ema_decay,
             "fsdp_devices": config.fsdp_devices,
             "log_interval": config.log_interval,
+            "telemetry_ema_steps": config.telemetry_ema_steps,
             "save_interval": config.save_interval,
             "keep_period": config.keep_period,
             "resume_step": config.resume_step,

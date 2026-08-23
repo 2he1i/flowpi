@@ -344,8 +344,9 @@ class Pi0(_model.BaseModel):
         Metrics (flowpi only; empty dict for baseline configs): the per-batch loss split by noise
         schedule (πR² vs standard), by horizon position (front / middle / tail third), and by τ
         bucket, the per-injection-layer gated cross-attention residual ratio r_l = |g_l C_l| / |h_l|,
-        and the fraction of πR² rows. Parameter-level signals (|tanh(gate)|, delay-embedding norm)
-        are computed from the param tree by the training loop (they do not need a forward pass).
+        split by the explicit Flow-required/normal sample mask, and the fraction of πR² rows.
+        Parameter-level signals (|tanh(gate)|, delay-embedding norm) are computed from the param tree
+        by the training loop (they do not need a forward pass).
         """
         preprocess_rng, noise_rng, time_rng, mix_rng = jax.random.split(rng, 4)
         geometric_aug = (
@@ -470,7 +471,7 @@ class Pi0(_model.BaseModel):
             valid_count = jnp.maximum(jnp.sum(loss_mask, axis=-1, keepdims=True), 1.0)
             loss = jnp.mean(sq, axis=-1) * loss_mask * (horizon / valid_count)
             return loss, {
-                **self._flow_loss_metrics(loss, sq, is_pir2, tau, loss_mask, flow_stats),
+                **self._flow_loss_metrics(loss, sq, is_pir2, tau, loss_mask, flow_stats, flow_required),
                 **flow_delay_metrics,
                 **self._flow_required_loss_metrics(loss, flow_required),
             }
@@ -507,7 +508,8 @@ class Pi0(_model.BaseModel):
         is_pir2: at.Bool[at.Array, " *b"],
         tau: at.Float[at.Array, " *b ah"],
         loss_mask: at.Float[at.Array, " *b ah"],
-        flow_stats: at.Float[at.Array, " _slots"],
+        flow_stats: at.Float[at.Array, "b _slots"],
+        flow_required: at.Bool[at.Array, "*b"] | None,
     ) -> dict[str, at.Array]:
         """Telemetry from the πR² loss forward (one shared computation, no extra forward)."""
         metrics: dict[str, at.Array] = {}
@@ -543,9 +545,37 @@ class Pi0(_model.BaseModel):
             mask = ((tau >= lo) & upper).astype(jnp.float32) * loss_mask
             metrics[f"loss_tau_{name}"] = masked_mean(per_pos, mask)
 
-        if flow_stats is not None:
-            for slot, layer in enumerate(self.flow_config.injection_layers):
-                metrics[f"flow_ca_residual_ratio_layer{layer}"] = flow_stats[slot]
+        metrics.update(self._flow_residual_metrics(flow_stats, flow_required))
+        return metrics
+
+    def _flow_residual_metrics(
+        self, flow_stats: at.Float[at.Array, "b _slots"] | None, flow_required: at.Bool[at.Array, "*b"] | None
+    ) -> dict[str, at.Array]:
+        """Returns batch and Flow-required/normal splits of the per-sample CA residual ratios."""
+        if flow_stats is None or self.flow_config is None or flow_stats.ndim != 2:
+            return {}
+
+        stats = jnp.asarray(flow_stats, dtype=jnp.float32)
+        flow_required = (
+            jnp.zeros((stats.shape[0],), dtype=jnp.bool_)
+            if flow_required is None
+            else jnp.asarray(flow_required, dtype=jnp.bool_).reshape(-1)
+        )
+        if flow_required.shape[0] != stats.shape[0]:
+            raise ValueError(
+                "flow_required must have one value per Flow residual sample: "
+                f"got {flow_required.shape[0]} values for batch {stats.shape[0]}"
+            )
+
+        metrics: dict[str, at.Array] = {}
+        for slot, layer in enumerate(self.flow_config.injection_layers):
+            residual = stats[:, slot]
+            metrics[f"flow_ca_residual_ratio_layer{layer}"] = jnp.mean(residual)
+            for group_name, mask in (("flow_required", flow_required), ("normal", ~flow_required)):
+                mask_f = mask.astype(jnp.float32)
+                metrics[f"flow_ca_residual_ratio_layer{layer}_{group_name}"] = jnp.sum(residual * mask_f) / (
+                    jnp.sum(mask_f) + 1e-8
+                )
         return metrics
 
     def _sample_actions_with_prefix(

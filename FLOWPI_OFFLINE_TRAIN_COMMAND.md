@@ -119,3 +119,65 @@ FLOWPI_GLOBAL_BATCH=128 \
 FLOWPI_WANDB_ENABLED=0 \
 bash scripts/train_flowpi_flow_required_8xh200.sh
 ```
+
+## 从 Step 10000 续训（当前 4 卡 H200 实验）
+
+服务器停止前实际算到了 Step 10590，但最后完整落盘的 checkpoint 是 Step 10000。
+如果继续使用 4 卡 H200，执行下面命令；不要设置 `FLOWPI_OVERWRITE=1`：
+
+```bash
+cd /inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/zheli/DOMINO/policy/flowpi && \
+OPENPI_DATA_HOME=/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/zheli/DOMINO/policy/pi05/offline_assets/openpi_cache \
+FLOWPI_WEIGHT_LOADER_PATH=/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/zheli/DOMINO/policy/pi05/offline_assets/openpi_cache/openpi-assets/checkpoints/pi05_base/params \
+JAX_PLATFORMS=cuda \
+FLOWPI_XLA_MEM_FRACTION=0.98 \
+FLOWPI_SAVE_INTERVAL=2000 \
+FLOWPI_EXP_NAME=flowpi_4xh200_flow_required \
+FLOWPI_LOG_ROOT=/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/zheli/DOMINO/policy/flowpi/logs/flowpi_cache_train \
+FLOWPI_FLOW_REQUIRED_PROB=0.5 \
+FLOWPI_FLOW_REQUIRED_VLM_DELAY_MIN=5 \
+FLOWPI_FLOW_GATE_INIT=0.01 \
+FLOWPI_RESUME=1 \
+FLOWPI_RESUME_STEP=10000 \
+FLOWPI_OVERWRITE=0 \
+FLOWPI_SEA_RAFT_CKPT=/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/zheli/SEA-RAFT-FT/SEA-RAFT/checkpoints/24000_robot-ft-M-4gpu-shadow-15k-to-25k_robot-ft-M-4gpu-shadow-15k-to-25k-20260822-053345.pth \
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+FLOWPI_EXPECTED_GPUS=4 \
+FLOWPI_GLOBAL_BATCH=64 \
+FLOWPI_WANDB_ENABLED=0 \
+bash scripts/train_flowpi_flow_required_8xh200.sh
+```
+
+## 从 Step 10000 续训（8 卡 H100）
+
+8×H100 与该 checkpoint 和 launcher 兼容。相比 4×H200，8 张卡通常会更快，
+但 H100 常见显存为 80GB，因此先保持 `global batch=64`（每卡 8），不要直接使用
+`global batch=128`（每卡 16）。这会保持同一个全局 batch，主要通过更多数据并行卡提升吞吐。
+
+```bash
+cd /inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/zheli/DOMINO/policy/flowpi && \
+OPENPI_DATA_HOME=/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/zheli/DOMINO/policy/pi05/offline_assets/openpi_cache \
+FLOWPI_WEIGHT_LOADER_PATH=/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/zheli/DOMINO/policy/pi05/offline_assets/openpi_cache/openpi-assets/checkpoints/pi05_base/params \
+JAX_PLATFORMS=cuda \
+FLOWPI_XLA_MEM_FRACTION=0.90 \
+FLOWPI_SAVE_INTERVAL=2000 \
+FLOWPI_EXP_NAME=flowpi_4xh200_flow_required \
+FLOWPI_LOG_ROOT=/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/zheli/DOMINO/policy/flowpi/logs/flowpi_cache_train \
+FLOWPI_FLOW_REQUIRED_PROB=0.5 \
+FLOWPI_FLOW_REQUIRED_VLM_DELAY_MIN=5 \
+FLOWPI_FLOW_GATE_INIT=0.01 \
+FLOWPI_RESUME=1 \
+FLOWPI_RESUME_STEP=10000 \
+FLOWPI_OVERWRITE=0 \
+FLOWPI_SEA_RAFT_CKPT=/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/zheli/SEA-RAFT-FT/SEA-RAFT/checkpoints/24000_robot-ft-M-4gpu-shadow-15k-to-25k_robot-ft-M-4gpu-shadow-15k-to-25k-20260822-053345.pth \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+FLOWPI_EXPECTED_GPUS=8 \
+FLOWPI_GLOBAL_BATCH=64 \
+FLOWPI_WANDB_ENABLED=0 \
+bash scripts/train_flowpi_flow_required_8xh200.sh
+```
+
+该命令会继续使用同一个 checkpoint namespace：
+`checkpoints/flowpi_aloha/flowpi_4xh200_flow_required/`，并创建新的日志 run。
+如果 H100 仍然 OOM，将 `FLOWPI_GLOBAL_BATCH=64` 降为 `32`（每卡 4）；不要删除
+Step 10000 checkpoint。

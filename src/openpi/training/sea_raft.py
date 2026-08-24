@@ -6,9 +6,11 @@ part of the JAX model. During training, flow is consumed from a precomputed offl
 this extractor is only used for cache precomputation, inference, and tests.
 """
 
+import contextlib
 import functools
 import hashlib
 import inspect
+import os
 import pathlib
 import sys
 
@@ -16,6 +18,8 @@ import numpy as np
 import torch
 
 _SEA_RAFT_CORE_DIR = pathlib.Path(__file__).resolve().parents[3] / "SEA-RAFT" / "core"
+_SEA_RAFT_CHECKPOINT_DIR = _SEA_RAFT_CORE_DIR.parent / "ckpt"
+_DEFAULT_INFERENCE_CHECKPOINT = _SEA_RAFT_CHECKPOINT_DIR / "shadow-24k.pth"
 
 _VARIANT_CONFIGS = {
     # variant: (dim, iters, radius, block_dims)
@@ -47,6 +51,16 @@ def checkpoint_sha256(path: str | pathlib.Path | None) -> str | None:
     return digest.hexdigest()
 
 
+def default_inference_checkpoint() -> pathlib.Path:
+    """Return the repository-local raw SEA-RAFT checkpoint used by inference.
+
+    FlowPi training deliberately receives its own checkpoint through the training data config;
+    that file may be a fine-tuning/resume checkpoint containing optimizer state. Inference only
+    needs the model weights, which are kept separately under ``SEA-RAFT/ckpt``.
+    """
+    return _DEFAULT_INFERENCE_CHECKPOINT
+
+
 def _extract_model_state_dict(checkpoint: object) -> dict:
     """Extract model weights from raw SEA-RAFT or training-wrapper checkpoints."""
     if not isinstance(checkpoint, dict):
@@ -64,7 +78,7 @@ def _extract_model_state_dict(checkpoint: object) -> dict:
 def _make_raft_args(dim: int, iters: int, radius: int, block_dims: list[int]):
     # SEA-RAFT's RAFT constructor mutates the args namespace (e.g. `args.corr_levels = 4`), so we
     # use a plain namespace instead of a frozen dataclass.
-    from types import SimpleNamespace
+    from types import SimpleNamespace  # noqa: PLC0415
 
     return SimpleNamespace(
         dim=dim,
@@ -93,7 +107,7 @@ def _import_raft():
     core_dir = str(_SEA_RAFT_CORE_DIR)
     if core_dir not in sys.path:
         sys.path.insert(0, core_dir)
-    from raft import RAFT
+    from raft import RAFT  # noqa: PLC0415
 
     if "return_low_res" not in inspect.signature(RAFT.forward).parameters:
         raise RuntimeError(
@@ -106,12 +120,16 @@ class SeaRaftFlowExtractor:
     """Wraps a frozen SEA-RAFT (Tartan-M by default) model with a numpy interface.
 
     Args:
-        ckpt_path: Path to fine-tuned SEA-RAFT weights (.pt). If None, random weights are used.
+        ckpt_path: Path to raw model weights or a training-wrapper checkpoint (.pt/.pth). If None,
+            random weights are used.
         allow_random_init: If False (default), raise when `ckpt_path` is None. Set to True only
             for tests and smoke runs where random weights are acceptable.
         variant: Model variant ("S" | "M" | "L"). The user's fine-tuned weights use "M".
         device: Torch device for inference.
         iters: Number of refinement iterations (default from the variant config).
+        precision: Inference autocast mode (``fp32``, ``fp16``, ``bf16``, or ``auto``). The
+            default remains ``fp32`` so offline training-cache generation is numerically stable;
+            deployment can opt into Tensor Core inference without changing the training path.
     """
 
     def __init__(
@@ -122,6 +140,7 @@ class SeaRaftFlowExtractor:
         iters: int | None = None,
         *,
         allow_random_init: bool = False,
+        precision: str = "fp32",
     ):
         effective_iters = resolve_sea_raft_iters(variant, iters)
         dim, _, radius, block_dims = _VARIANT_CONFIGS[variant]
@@ -133,6 +152,33 @@ class SeaRaftFlowExtractor:
         )
         self._iters = args.iters
         self._device = torch.device(device)
+        precision = str(precision).lower()
+        if precision not in {"fp32", "fp16", "bf16", "auto"}:
+            raise ValueError(f"Unsupported SEA-RAFT inference precision {precision!r}; use fp32, fp16, bf16, or auto")
+        if precision == "auto":
+            precision = "fp16" if self._device.type == "cuda" else "fp32"
+        if self._device.type != "cuda" and precision != "fp32":
+            # CPU autocast is not a useful or consistent deployment path for SEA-RAFT. Keep the
+            # extractor usable in CPU smoke tests while making the fallback explicit in metrics.
+            precision = "fp32"
+        self._precision = precision
+        self._amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(precision)
+        if self._device.type == "cuda":
+            # The policy server already owns JAX's CPU dispatch pools. Limiting Torch's host
+            # helper pools for inference prevents 64 inter-op/intra-op workers from competing
+            # with the fast RPC and slow-channel scheduler. This changes no CUDA kernels or
+            # model inputs; it is opt-in so offline training/cache generation keeps its default.
+            thread_setting = os.environ.get("FLOWPI_SEA_RAFT_TORCH_THREADS")
+            if thread_setting:
+                thread_count = int(thread_setting)
+                if thread_count <= 0:
+                    raise ValueError("FLOWPI_SEA_RAFT_TORCH_THREADS must be positive")
+                torch.set_num_threads(thread_count)
+                with contextlib.suppress(RuntimeError):
+                    torch.set_num_interop_threads(thread_count)
+            # Deployment uses one fixed geometry (six 480x640 images per request). Let cuDNN
+            # select the fastest convolution algorithms for that stable shape.
+            torch.backends.cudnn.benchmark = True
 
         raft_cls = _import_raft()
         # Random init when no checkpoint is given. Random weights produce garbage flow, so this
@@ -149,11 +195,22 @@ class SeaRaftFlowExtractor:
             p.requires_grad = False
 
         if ckpt_path is not None:
-            checkpoint = torch.load(str(ckpt_path), map_location=self._device)
+            # FlowPi only needs tensor weights from the raw SEA-RAFT or training-wrapper
+            # dictionary. Restrict deserialization to PyTorch's safe weights-only mode so an
+            # uploaded inference checkpoint cannot execute arbitrary pickle payloads.
+            checkpoint = torch.load(str(ckpt_path), map_location=self._device, weights_only=True)
             state_dict = _extract_model_state_dict(checkpoint)
             self._model.load_state_dict(state_dict, strict=True)
 
-    @torch.no_grad()
+    @contextlib.contextmanager
+    def _autocast(self):
+        if self._amp_dtype is None:
+            yield
+            return
+        with torch.autocast(device_type="cuda", dtype=self._amp_dtype):
+            yield
+
+    @torch.inference_mode()
     def compute(self, prev: np.ndarray, curr: np.ndarray) -> np.ndarray:
         """Compute 1/8-resolution optical flow between two image stacks.
 
@@ -178,10 +235,13 @@ class SeaRaftFlowExtractor:
         t1 = torch.from_numpy(prev.reshape(b * n_cam, *prev.shape[2:])).to(self._device)
         t2 = torch.from_numpy(curr.reshape(b * n_cam, *curr.shape[2:])).to(self._device)
 
-        out = self._model(t1, t2, iters=self._iters, test_mode=True, return_low_res=True)
+        with self._autocast():
+            out = self._model(t1, t2, iters=self._iters, test_mode=True, return_low_res=True)
         if "flow_8x" not in out:
             raise RuntimeError(
                 "SEA-RAFT return_low_res=True did not return flow_8x. Run `uv run python scripts/setup_sea_raft.py`."
             )
-        flow_8x = out["flow_8x"].cpu().numpy()
+        # Keep the public contract stable even when AMP is enabled: downstream normalization and
+        # JAX transfer always receive float32 flow.
+        flow_8x = out["flow_8x"].float().cpu().numpy()
         return flow_8x.reshape(b, n_cam, *flow_8x.shape[1:])

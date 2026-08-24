@@ -91,22 +91,11 @@ class FlowDataConfig:
     load_flow_cache: bool = True
     # Include the DelaySlowImage transform (stale VLM image simulation).
     sample_vlm_delay: bool = True
-    # Flow-required slow-prefix recipe: on this fraction of samples, restrict the VLM delay to
-    # the stale tail while keeping Flow age sampling independent. Defaults preserve the existing
-    # training distribution exactly.
-    flow_required_prob: float = 0.0
-    flow_required_vlm_delay_min: int = 0
 
     def __post_init__(self) -> None:
         from openpi.training.sea_raft import resolve_sea_raft_iters
 
         object.__setattr__(self, "sea_raft_iters", resolve_sea_raft_iters(self.sea_raft_variant, self.sea_raft_iters))
-        if not 0.0 <= self.flow_required_prob <= 1.0:
-            raise ValueError(f"flow_required_prob must be in [0, 1], got {self.flow_required_prob}")
-        if self.flow_required_vlm_delay_min < 0:
-            raise ValueError(
-                f"flow_required_vlm_delay_min must be non-negative, got {self.flow_required_vlm_delay_min}"
-            )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -388,12 +377,7 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
             if self.flow.sample_vlm_delay:
                 flow_transforms.append(
                     _transforms.DelaySlowImage(
-                        model_flow.vlm_delay_max,
-                        frame_offsets,
-                        seed=0,
-                        distribution=model_flow.vlm_delay_distribution,
-                        flow_required_prob=self.flow.flow_required_prob,
-                        flow_required_vlm_delay_min=self.flow.flow_required_vlm_delay_min,
+                        model_flow.vlm_delay_max, frame_offsets, seed=0, distribution=model_flow.vlm_delay_distribution
                     )
                 )
             if flow_transforms:
@@ -675,8 +659,6 @@ class TrainConfig:
 
     # How often (in steps) to log training metrics.
     log_interval: int = 100
-    # Effective window for the host-side Flow residual telemetry EMA.
-    telemetry_ema_steps: int = 500
     # How often (in steps) to save checkpoints.
     save_interval: int = 1000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
@@ -726,8 +708,6 @@ class TrainConfig:
                 raise ValueError(f"resume_step must be non-negative, got {self.resume_step}")
             if not self.resume:
                 raise ValueError("resume_step requires resume=True")
-        if not 100 <= self.telemetry_ema_steps <= 500:
-            raise ValueError(f"telemetry_ema_steps must be in [100, 500], got {self.telemetry_ema_steps}")
 
 
 def _flowpi_ablation_configs() -> tuple[TrainConfig, ...]:
@@ -1349,62 +1329,6 @@ _CONFIGS = [
         ).get_freeze_filter(),
         num_train_steps=20_000,
         batch_size=32,
-    ),
-    TrainConfig(
-        # Memory-aware FlowPI recipe for eight RTX 4090 GPUs. The PaliGemma VLM and Action
-        # Expert use LoRA; all FlowPI modules remain full-parameter trainable, while SigLIP is
-        # frozen.
-        name="flowpi_aloha_8x4090_lora",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            discrete_state_input=False,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-            flow=pi0_config.FlowConfig(),
-            freeze_vision_encoder=True,
-        ),
-        data=LeRobotAlohaDataConfig(
-            repo_id="flowpi_data/train_dataset",
-            base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(
-                assets_dir="assets/flowpi_aloha",
-                asset_id="flowpi_data/train_dataset",
-            ),
-            repack_transforms=_transforms.Group(
-                inputs=[
-                    _transforms.RepackTransform(
-                        {
-                            "images": {
-                                "cam_high": "observation.images.cam_high",
-                                "cam_left_wrist": "observation.images.cam_left_wrist",
-                                "cam_right_wrist": "observation.images.cam_right_wrist",
-                            },
-                            "state": "observation.state",
-                            "actions": "action",
-                            "prompt": "prompt",
-                        }
-                    )
-                ]
-            ),
-            flow=FlowDataConfig(
-                mode="cache",
-                flow_cache_dir="flowpi_data/flow_cache",
-                sea_raft_ckpt="<your-sea-raft-ckpt>",
-                sea_raft_device="cuda",
-            ),
-        ),
-        weight_loader=weight_loaders.FlowPiWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            discrete_state_input=False,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-            flow=pi0_config.FlowConfig(),
-            freeze_vision_encoder=True,
-        ).get_freeze_filter(),
-        num_train_steps=30_000,
-        batch_size=32,
-        ema_decay=None,
     ),
     #
     # flowpi ablation configs A-E. Every variant shares the flowpi_aloha training recipe: the

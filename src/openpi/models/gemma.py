@@ -27,7 +27,6 @@ We follow this einsum axis naming convention:
 
 from collections.abc import Sequence
 import dataclasses
-import math
 from typing import Literal, TypeAlias
 
 import einops
@@ -388,16 +387,14 @@ class Block(nn.Module):
                 g = jnp.tanh(flow_params["flow_gate"][flow_slot]).astype(h.dtype)
                 h_out = h + g * ca.astype(h.dtype)
                 # Telemetry: magnitude of the gated CA residual relative to the hidden state at
-                # this layer (r_l = |g_l C_l| / |h_l|), retained per batch element so the caller
-                # can split it by the Flow-required/normal sample mask.
-                reduce_axes = tuple(range(1, h.ndim))
-                ratio = jnp.mean(jnp.abs(g * ca.astype(h.dtype)), axis=reduce_axes, dtype=jnp.float32) / (
-                    jnp.mean(jnp.abs(h), axis=reduce_axes, dtype=jnp.float32) + 1e-6
+                # this layer (r_l = |g_l C_l| / |h_l|), a float32 scalar per batch element.
+                ratio = jnp.mean(jnp.abs(g * ca.astype(h.dtype)), dtype=jnp.float32) / (
+                    jnp.mean(jnp.abs(h), dtype=jnp.float32) + 1e-6
                 )
                 return h_out, ratio
 
             def no_inject(h):
-                return h, jnp.zeros((h.shape[0],), dtype=jnp.float32)
+                return h, jnp.zeros((), dtype=jnp.float32)
 
             # Non-injection layers skip the cross-attention matmul entirely. Prefix-only passes
             # (expert 1 is None) skip injection as well.
@@ -405,7 +402,7 @@ class Block(nn.Module):
                 new_h, flow_stat = jax.lax.cond(flow_slot >= 0, inject, no_inject, xs[1])
                 xs = [xs[0], new_h]
             else:
-                flow_stat = jnp.zeros((flow.shape[0],), dtype=jnp.float32)
+                flow_stat = jnp.zeros((), dtype=jnp.float32)
         else:
             flow_stat = jnp.zeros((), dtype=jnp.float32)
 
@@ -425,9 +422,6 @@ class FlowGeom:
     num_heads: int = 8
     head_dim: int = 128
     injection_layers: tuple[int, ...] = (7, 12, 16)
-    # Target magnitude of tanh(flow_gate) at initialization. Zero keeps exact baseline
-    # equivalence; a small positive value is useful for Flow-required training recipes.
-    flow_gate_init: float = 0.0
 
 
 @at.typecheck
@@ -497,14 +491,8 @@ class Module(nn.Module):
                 nn.initializers.lecun_normal(in_axis=(-3, -2), out_axis=-1),
                 (n_slots, n_heads, head_dim, width_e1),
             )
-            # flow_pre_norm_scale remains zero-initialized. flow_gate is zero by default for
-            # exact π0.5 equivalence, or receives a small constant raw value whose tanh matches
-            # FlowGeom.flow_gate_init for Flow-required training.
-            if self.flow_geom.flow_gate_init == 0.0:
-                gate_init = nn.initializers.zeros_init()
-            else:
-                gate_init = nn.initializers.constant(math.atanh(self.flow_geom.flow_gate_init))
-            self.flow_gate = self.param("flow_gate", gate_init, (n_slots, width_e1))
+            # The ONLY zero-initialized flow parameters (initial tanh(gate)=0 => exact π0.5 equivalence).
+            self.flow_gate = self.param("flow_gate", nn.initializers.zeros_init(), (n_slots, width_e1))
             self.flow_pre_norm_scale = self.param(
                 "flow_pre_norm_scale", nn.initializers.zeros_init(), (n_slots, width_e1)
             )
@@ -547,7 +535,7 @@ class Module(nn.Module):
         return_flow_stats: bool = False,
     ) -> (
         tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]
-        | tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache, at.Float[at.Array, "b _slots"]]
+        | tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache, at.Float[at.Array, " _slots"]]
     ):
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
@@ -585,15 +573,12 @@ class Module(nn.Module):
         ]
         if not return_flow_stats:
             return outputs, kv_cache
-        # Per-sample, per-slot CA residual ratios (0.0 for non-injection layers); when the
-        # flow branch is disabled the per-slot values are all zero.
+        # Per-slot CA residual ratios (0.0 for non-injection layers); when the flow branch is
+        # disabled the per-slot values are all zero.
         if self.flow_geom is None:
             flow_stats = jnp.zeros((len(self.flow_geom or ()),), dtype=jnp.float32)
         else:
-            # nn.scan stacks the per-layer [batch] values as [depth, batch]. Select the
-            # injection layers and move batch to the leading axis for downstream masking.
             flow_stats = flow_stats[jnp.asarray(self.flow_geom.injection_layers)]
-            flow_stats = jnp.moveaxis(flow_stats, 0, 1)
         return outputs, kv_cache, flow_stats
 
     def init(self, use_adarms: Sequence[bool]):

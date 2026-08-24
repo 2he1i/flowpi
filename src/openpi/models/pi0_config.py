@@ -1,5 +1,4 @@
 import dataclasses
-import math
 from typing import TYPE_CHECKING
 
 import flax.nnx as nnx
@@ -36,10 +35,6 @@ class FlowConfig:
     num_cross_heads: int = 8
     cross_head_dim: int = 128
     injection_layers: tuple[int, ...] | None = None  # None => (7, 12, 16)
-    # Initial magnitude of tanh(flow_gate). The default preserves the exact π0.5-compatible
-    # zero-gate initialization; a small non-zero value lets a Flow-required training recipe
-    # propagate signal through the tokenizer/CA branch from the first update.
-    flow_gate_init: float = 0.0
     # πR².
     d_max: int = 5  # must be < action_horizon / 2
     p_standard: float = 0.2
@@ -139,8 +134,6 @@ class FlowConfig:
             raise ValueError(f"num_cross_heads must be positive, got {self.num_cross_heads}")
         if self.cross_head_dim <= 0:
             raise ValueError(f"cross_head_dim must be positive, got {self.cross_head_dim}")
-        if not math.isfinite(self.flow_gate_init) or not 0.0 <= self.flow_gate_init < 1.0:
-            raise ValueError(f"flow_gate_init must be finite and in [0, 1), got {self.flow_gate_init}")
         if self.injection_layers is not None:
             if any(layer < 0 for layer in self.injection_layers):
                 raise ValueError(f"injection_layers must be non-negative, got {self.injection_layers}")
@@ -264,9 +257,6 @@ class Pi0Config(_model.BaseModelConfig):
                 flow_delay=(
                     jax.ShapeDtypeStruct([batch_size], jnp.int32) if flow is not None and flow.enabled else None
                 ),
-                flow_required=(
-                    jax.ShapeDtypeStruct([batch_size], jnp.bool_) if flow is not None and flow.enabled else None
-                ),
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 
@@ -299,16 +289,11 @@ class Pi0Config(_model.BaseModelConfig):
             filters.append(
                 nnx.Not(nnx_utils.PathRegex(".*lora.*")),
             )
-
-        # Freeze SigLIP independently of the language/LoRA policy. In particular, the LoRA
-        # branch above may already have filters, so this must not be hidden behind the
-        # no-LoRA case. This keeps a VLM-LoRA + full Action Expert recipe from accidentally
-        # training the vision tower.
-        if self.freeze_vision_encoder:
-            filters.append(nnx_utils.PathRegex("PaliGemma/img.*"))
-
         if not filters:
-            # With no LoRA and no frozen vision tower the upstream default is to train everything.
-            # FlowPI keeps SEA-RAFT frozen outside the JAX parameter tree.
+            # With no LoRA the upstream default is to train everything. The flowpi frozen-vision
+            # policy opts in via `freeze_vision_encoder` (flowpi additionally keeps SEA-RAFT
+            # frozen outside the JAX parameter tree).
+            if self.freeze_vision_encoder:
+                return nnx_utils.PathRegex("PaliGemma/img.*")
             return nnx.Nothing
         return nnx.All(*filters)

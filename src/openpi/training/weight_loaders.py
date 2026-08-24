@@ -100,8 +100,12 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
     Returns:
         A new dictionary with the merged parameters.
     """
-    flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
-    flat_loaded = flax.traverse_util.flatten_dict(loaded_params, sep="/")
+    # Keep paths as tuples instead of joining them with ``sep="/"``. Some Flax parameter
+    # trees use integer keys for indexed modules (for example ``llm.layers[0]``), and joining
+    # those paths directly raises ``TypeError: expected str instance, int found``. Tuple paths
+    # also preserve the original key types when the result is reconstructed below.
+    flat_ref = flax.traverse_util.flatten_dict(params)
+    flat_loaded = flax.traverse_util.flatten_dict(loaded_params)
 
     # First, take all weights that are a subset of the reference weights.
     result = {}
@@ -113,8 +117,13 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
 
     # Then, merge any missing weights as defined by the missing regex.
     pattern = re.compile(missing_regex)
-    for k in {k for k in flat_ref if pattern.fullmatch(k)}:
+    for k in {k for k in flat_ref if pattern.fullmatch(_param_path_string(k))}:
         if k not in result:
             result[k] = flat_ref[k]
 
-    return flax.traverse_util.unflatten_dict(result, sep="/")
+    return flax.traverse_util.unflatten_dict(result)
+
+
+def _param_path_string(path: tuple[object, ...]) -> str:
+    """Convert a parameter path to the string form used by missing-parameter regexes."""
+    return "/".join(str(part) for part in path)

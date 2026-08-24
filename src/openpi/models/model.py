@@ -35,6 +35,33 @@ class ModelType(enum.Enum):
     PI05 = "pi05"
 
 
+def _align_numeric_dict_keys(expected, got):
+    """Align numeric string keys from older NNX/Orbax list serialization.
+
+    Some checkpoints serialize an NNX ``list`` field as a dictionary whose keys are
+    strings (for example ``{"0": ..., "1": ...}``), while the current NNX graph
+    represents the same field with integer keys.  The values are unchanged; only the
+    pytree metadata differs.  Align keys only when the converted key set exactly
+    matches the expected tree, so ordinary string-keyed dictionaries are untouched.
+    """
+    if isinstance(expected, dict) and isinstance(got, dict):
+        if expected.keys() != got.keys():
+            converted = {}
+            can_convert = True
+            for key, value in got.items():
+                if not isinstance(key, str) or not key.isdigit():
+                    can_convert = False
+                    break
+                converted[int(key)] = value
+            if can_convert and converted.keys() == expected.keys():
+                got = converted
+
+        if expected.keys() == got.keys():
+            return {key: _align_numeric_dict_keys(expected[key], got[key]) for key in expected}
+
+    return got
+
+
 # The model always expects these images
 IMAGE_KEYS = (
     "base_0_rgb",
@@ -68,9 +95,7 @@ IMAGE_RESOLUTION = (224, 224)
 #     "tokenized_prompt_mask": bool[*b, l],  # Optional, mask for tokenized prompt
 #     "token_ar_mask": int32[*b, l],  # Optional, autoregressive mask for FAST model
 #     "token_loss_mask": bool[*b, l],  # Optional, loss mask for FAST model
-#     "vlm_delay": int32[*b],  # Optional, age of the slow VLM prefix
 #     "flow_delay": int32[*b],  # Optional, age of the cached flow target tick
-#     "flow_required": bool[*b],  # Optional, eligible forced-stale VLM sample mask
 #
 #      # Actions data.
 #      "actions": float32[*b ah ad]
@@ -119,8 +144,6 @@ class Observation(Generic[ArrayT]):
     vlm_delay: at.Int[ArrayT, "*b"] | None = None
     # Flow-channel age (ticks between the current action tick and the flow target tick), int [*b].
     flow_delay: at.Int[ArrayT, "*b"] | None = None
-    # Whether this sample was selected for the eligible forced-stale VLM-prefix subset, bool [*b].
-    flow_required: at.Bool[ArrayT, "*b"] | None = None
 
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
@@ -146,7 +169,6 @@ class Observation(Generic[ArrayT]):
             flow_masks=data.get("flow_masks"),
             vlm_delay=data.get("vlm_delay"),
             flow_delay=data.get("flow_delay"),
-            flow_required=data.get("flow_required"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -238,7 +260,6 @@ def preprocess_observation(
         flow_masks=observation.flow_masks,
         vlm_delay=observation.vlm_delay,
         flow_delay=observation.flow_delay,
-        flow_required=observation.flow_required,
     )
 
 
@@ -270,6 +291,7 @@ class BaseModelConfig(abc.ABC):
         graphdef, state = nnx.split(model)
         if remove_extra_params:
             params = ocp.transform_utils.intersect_trees(state.to_pure_dict(), params)
+        params = _align_numeric_dict_keys(state.to_pure_dict(), params)
         at.check_pytree_equality(expected=state.to_pure_dict(), got=params, check_shapes=True, check_dtypes=False)
         state.replace_by_pure_dict(params)
         return nnx.merge(graphdef, state)

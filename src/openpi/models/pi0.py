@@ -96,7 +96,6 @@ class Pi0(_model.BaseModel):
                 num_heads=flow_cfg.num_cross_heads,
                 head_dim=flow_cfg.cross_head_dim,
                 injection_layers=tuple(injection_layers),
-                flow_gate_init=flow_cfg.flow_gate_init,
             )
 
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -344,9 +343,8 @@ class Pi0(_model.BaseModel):
         Metrics (flowpi only; empty dict for baseline configs): the per-batch loss split by noise
         schedule (πR² vs standard), by horizon position (front / middle / tail third), and by τ
         bucket, the per-injection-layer gated cross-attention residual ratio r_l = |g_l C_l| / |h_l|,
-        split by the explicit Flow-required/normal sample mask, and the fraction of πR² rows.
-        Parameter-level signals (|tanh(gate)|, delay-embedding norm) are computed from the param tree
-        by the training loop (they do not need a forward pass).
+        and the fraction of πR² rows. Parameter-level signals (|tanh(gate)|, delay-embedding norm)
+        are computed from the param tree by the training loop (they do not need a forward pass).
         """
         preprocess_rng, noise_rng, time_rng, mix_rng = jax.random.split(rng, 4)
         geometric_aug = (
@@ -439,7 +437,6 @@ class Pi0(_model.BaseModel):
 
         sq = jnp.square(v_t - u_t)
         flow_delay_metrics = {}
-        flow_required = None
         if self.flow_config is not None:
             # Missing flow_delay is the backwards-compatible synchronous value d_flow=0.
             flow_delay = (
@@ -448,58 +445,19 @@ class Pi0(_model.BaseModel):
                 else jnp.asarray(observation.flow_delay, dtype=jnp.float32)
             )
             flow_delay = jnp.clip(flow_delay, 0, self.flow_config.flow_delay_max)
-            vlm_delay = (
-                jnp.zeros(observation.state.shape[:-1], dtype=jnp.float32)
-                if observation.vlm_delay is None
-                else jnp.asarray(observation.vlm_delay, dtype=jnp.float32)
-            )
-            vlm_delay = jnp.clip(vlm_delay, 0, self.flow_config.vlm_delay_max)
-            flow_required = (
-                jnp.zeros(observation.state.shape[:-1], dtype=jnp.bool_)
-                if observation.flow_required is None
-                else jnp.asarray(observation.flow_required, dtype=jnp.bool_)
-            )
             flow_delay_metrics = {
                 "mean_flow_delay": jnp.mean(flow_delay),
                 "frac_flow_delay_0": jnp.mean((flow_delay == 0).astype(jnp.float32)),
-                "mean_vlm_delay": jnp.mean(vlm_delay),
-                "frac_vlm_delay_max": jnp.mean((vlm_delay == self.flow_config.vlm_delay_max).astype(jnp.float32)),
-                "frac_flow_required": jnp.mean(flow_required.astype(jnp.float32)),
             }
         if self.flow_config is not None and self.pi05 and self.flow_config.use_pir2:
             # Renormalize valid positions so the outer mean matches the baseline π0.5 loss scale.
             valid_count = jnp.maximum(jnp.sum(loss_mask, axis=-1, keepdims=True), 1.0)
             loss = jnp.mean(sq, axis=-1) * loss_mask * (horizon / valid_count)
             return loss, {
-                **self._flow_loss_metrics(loss, sq, is_pir2, tau, loss_mask, flow_stats, flow_required),
+                **self._flow_loss_metrics(loss, sq, is_pir2, tau, loss_mask, flow_stats),
                 **flow_delay_metrics,
-                **self._flow_required_loss_metrics(loss, flow_required),
             }
-        loss = jnp.mean(sq, axis=-1)
-        if self.flow_config is not None:
-            flow_delay_metrics = {
-                **flow_delay_metrics,
-                **self._flow_required_loss_metrics(loss, flow_required),
-            }
-        return loss, flow_delay_metrics
-
-    def _flow_required_loss_metrics(
-        self, loss: at.Float[at.Array, "*b ah"], flow_required: at.Bool[at.Array, "*b"] | None
-    ) -> dict[str, at.Array]:
-        """Splits the per-example action loss by the explicit forced-stale sample mask."""
-        if flow_required is None:
-            flow_required = jnp.zeros(loss.shape[:-1], dtype=jnp.bool_)
-        flow_required = jnp.asarray(flow_required, dtype=jnp.bool_)
-        row_loss = jnp.mean(loss.astype(jnp.float32), axis=-1)
-
-        def masked_row_mean(mask: jax.Array) -> jax.Array:
-            mask_f = mask.astype(jnp.float32)
-            return jnp.sum(row_loss * mask_f) / (jnp.sum(mask_f) + 1e-8)
-
-        return {
-            "loss_flow_required": masked_row_mean(flow_required),
-            "loss_normal": masked_row_mean(~flow_required),
-        }
+        return jnp.mean(sq, axis=-1), flow_delay_metrics
 
     def _flow_loss_metrics(
         self,
@@ -508,8 +466,7 @@ class Pi0(_model.BaseModel):
         is_pir2: at.Bool[at.Array, " *b"],
         tau: at.Float[at.Array, " *b ah"],
         loss_mask: at.Float[at.Array, " *b ah"],
-        flow_stats: at.Float[at.Array, "b _slots"],
-        flow_required: at.Bool[at.Array, "*b"] | None,
+        flow_stats: at.Float[at.Array, " _slots"],
     ) -> dict[str, at.Array]:
         """Telemetry from the πR² loss forward (one shared computation, no extra forward)."""
         metrics: dict[str, at.Array] = {}
@@ -545,37 +502,9 @@ class Pi0(_model.BaseModel):
             mask = ((tau >= lo) & upper).astype(jnp.float32) * loss_mask
             metrics[f"loss_tau_{name}"] = masked_mean(per_pos, mask)
 
-        metrics.update(self._flow_residual_metrics(flow_stats, flow_required))
-        return metrics
-
-    def _flow_residual_metrics(
-        self, flow_stats: at.Float[at.Array, "b _slots"] | None, flow_required: at.Bool[at.Array, "*b"] | None
-    ) -> dict[str, at.Array]:
-        """Returns batch and Flow-required/normal splits of the per-sample CA residual ratios."""
-        if flow_stats is None or self.flow_config is None or flow_stats.ndim != 2:
-            return {}
-
-        stats = jnp.asarray(flow_stats, dtype=jnp.float32)
-        flow_required = (
-            jnp.zeros((stats.shape[0],), dtype=jnp.bool_)
-            if flow_required is None
-            else jnp.asarray(flow_required, dtype=jnp.bool_).reshape(-1)
-        )
-        if flow_required.shape[0] != stats.shape[0]:
-            raise ValueError(
-                "flow_required must have one value per Flow residual sample: "
-                f"got {flow_required.shape[0]} values for batch {stats.shape[0]}"
-            )
-
-        metrics: dict[str, at.Array] = {}
-        for slot, layer in enumerate(self.flow_config.injection_layers):
-            residual = stats[:, slot]
-            metrics[f"flow_ca_residual_ratio_layer{layer}"] = jnp.mean(residual)
-            for group_name, mask in (("flow_required", flow_required), ("normal", ~flow_required)):
-                mask_f = mask.astype(jnp.float32)
-                metrics[f"flow_ca_residual_ratio_layer{layer}_{group_name}"] = jnp.sum(residual * mask_f) / (
-                    jnp.sum(mask_f) + 1e-8
-                )
+        if flow_stats is not None:
+            for slot, layer in enumerate(self.flow_config.injection_layers):
+                metrics[f"flow_ca_residual_ratio_layer{layer}"] = flow_stats[slot]
         return metrics
 
     def _sample_actions_with_prefix(
@@ -585,6 +514,7 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        prefix: tuple | None = None,
     ) -> tuple[_model.Actions, tuple, jax.Array]:
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
@@ -597,11 +527,17 @@ class Pi0(_model.BaseModel):
         # flow tokens are computed once per full denoising (standard path: warm-start / baselines).
         flow_embedded = self.embed_flow(observation)
 
-        # first fill KV cache with a forward pass of the prefix
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
-        positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        # First fill the KV cache with a forward pass of the prefix, unless the runtime supplied
+        # a prefix produced by the dedicated slow-channel model on another GPU. The cache and
+        # mask have the same layout because both replicas use the same model config/weights.
+        if prefix is None:
+            prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+            prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+            positions = jnp.cumsum(prefix_mask, axis=1) - 1
+            _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        else:
+            kv_cache, prefix_mask = prefix
+        prefix_len = prefix_mask.shape[1]
 
         def step(carry):
             x_t, time = carry
@@ -620,7 +556,7 @@ class Pi0(_model.BaseModel):
             assert full_attn_mask.shape == (
                 batch_size,
                 suffix_tokens.shape[1],
-                prefix_tokens.shape[1] + suffix_tokens.shape[1],
+                prefix_len + suffix_tokens.shape[1],
             )
             # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
             positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
@@ -732,6 +668,7 @@ class Pi0(_model.BaseModel):
         num_steps: int = 10,
         d: int = 1,
         noise: jax.Array | None = None,
+        prefix: tuple | None = None,
     ) -> StreamingState:
         """Episode start: full standard denoising, then re-noise into the πR² staircase.
 
@@ -750,7 +687,7 @@ class Pi0(_model.BaseModel):
         # The standard denoising path already prefills the prefix. Reuse that completed KV cache
         # for the streaming state instead of running the same VLM prefix a second time.
         clean, kv_cache, prefix_mask = self._sample_actions_with_prefix(
-            sample_rng, observation, num_steps=num_steps, noise=noise
+            sample_rng, observation, num_steps=num_steps, noise=noise, prefix=prefix
         )
 
         eps = jax.random.normal(renoise_rng, clean.shape)

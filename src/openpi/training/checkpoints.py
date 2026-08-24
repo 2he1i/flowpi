@@ -12,17 +12,18 @@ from typing import TYPE_CHECKING, Any, Protocol
 from etils import epath
 import jax
 import jax.numpy as jnp
+import numpy as np
 import orbax.checkpoint as ocp
 import orbax.checkpoint.future as future
 
 from openpi.models import model as _model
 from openpi.shared import array_typing as at
 import openpi.shared.normalize as _normalize
-import openpi.training.data_loader as _data_loader
 import openpi.training.utils as training_utils
 
 if TYPE_CHECKING:
     import openpi.training.config as _config
+    import openpi.training.data_loader as _data_loader
 
 
 def initialize_checkpoint_dir(
@@ -103,7 +104,7 @@ def _training_config_metadata(config: _config.TrainConfig, step: int) -> dict[st
     return {
         "schema_version": 1,
         "saved_step": step,
-        "saved_at_utc": datetime.datetime.now(datetime.UTC).isoformat(),
+        "saved_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),  # noqa: UP017
         "training": {
             "batch_size": config.batch_size,
             "num_train_steps": config.num_train_steps,
@@ -112,7 +113,6 @@ def _training_config_metadata(config: _config.TrainConfig, step: int) -> dict[st
             "ema_decay": config.ema_decay,
             "fsdp_devices": config.fsdp_devices,
             "log_interval": config.log_interval,
-            "telemetry_ema_steps": config.telemetry_ema_steps,
             "save_interval": config.save_interval,
             "keep_period": config.keep_period,
             "resume_step": config.resume_step,
@@ -167,6 +167,12 @@ def _resolve_checkpoint_path(checkpoint_path: str) -> str:
     for candidate in candidates:
         if (candidate / "metadata.json").exists():
             return str(candidate)
+        # A training step directory may not contain the released-checkpoint metadata.json; its
+        # Orbax marker and params item are still sufficient to restore it. Honor an explicit
+        # ``latest`` symlink before falling back to numeric-step discovery so config/assets
+        # resolution can select the same step.
+        if (candidate / "_CHECKPOINT_METADATA").exists() and (candidate / "params").is_dir():
+            return str(candidate / "params")
     if path.is_dir():
         # The path itself is an orbax step dir (<step>/params + train_state + assets): resolve
         # its params item.
@@ -232,6 +238,7 @@ def load_model_from_checkpoint(
     checkpoint_path: str,
     *,
     dtype: jnp.dtype | None = None,
+    jax_device: jax.Device | str | None = None,
 ) -> _model.BaseModel:
     """Create a model with parameters restored from an openpi checkpoint.
 
@@ -245,11 +252,29 @@ def load_model_from_checkpoint(
         checkpoint_path: Path to a released checkpoint, an orbax step directory, or a training
             checkpoint root with a ``latest`` symlink.
         dtype: Optional dtype override for the restored params.
+        jax_device: Optional single JAX device for the restored params. Without this argument,
+            Orbax replicates the parameters across every visible device. Serving multiple model
+            replicas on different GPUs must pass this explicitly for each replica.
 
     Returns:
         The model with restored parameters.
     """
-    params = _model.restore_params(_resolve_checkpoint_path(checkpoint_path), dtype=dtype)
+    sharding = None
+    if jax_device is not None:
+        if isinstance(jax_device, str):
+            backend, _, index_text = jax_device.partition(":")
+            backend = "gpu" if backend == "cuda" else backend
+            index = int(index_text) if index_text else 0
+            devices = jax.devices(backend)
+            if not 0 <= index < len(devices):
+                raise ValueError(
+                    f"jax_device {jax_device!r}: backend {backend!r} has {len(devices)} devices"
+                )
+            jax_device = devices[index]
+        mesh = jax.sharding.Mesh(np.asarray([jax_device], dtype=object), ("x",))
+        sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+
+    params = _model.restore_params(_resolve_checkpoint_path(checkpoint_path), dtype=dtype, sharding=sharding)
     return model_config.load(params)
 
 

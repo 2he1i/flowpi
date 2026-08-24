@@ -28,9 +28,18 @@ Usage:
 
 import argparse
 import dataclasses
+import json
+import os
 import pathlib
 import time
 
+# Keep JAX from reserving all visible GPUs before the explicitly selected model/SEA-RAFT devices
+# are constructed. The online RoboTwin launcher sets this too, but the standalone replay script
+# must be safe when invoked directly.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
+import flowpi_checkpoint as _checkpoint_config
+import jax
 import numpy as np
 import torch
 
@@ -39,6 +48,7 @@ import openpi.policies.flowpi_runtime as flowpi_runtime
 import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
+import openpi.training.sea_raft as _sea_raft
 import openpi.transforms as _transforms
 
 
@@ -54,7 +64,21 @@ def _preserve_episode_index(group: _transforms.Group) -> _transforms.Group:
     raise ValueError("Replay requires a RepackTransform so it can detect episode boundaries.")
 
 
-def _create_inference_data_factory(train_config: _config.TrainConfig, checkpoint: str):
+def _default_single_jax_device() -> str:
+    """Choose one device for standalone replay instead of Orbax's all-device replication."""
+    try:
+        if jax.devices("gpu"):
+            return "gpu:0"
+    except RuntimeError:
+        pass
+    return "cpu"
+
+
+def _create_inference_data_factory(
+    train_config: _config.TrainConfig,
+    checkpoint: str,
+    sea_raft_ckpt: pathlib.Path,
+):
     """Keep runtime settings while removing transforms that only belong to training.
 
     A FlowPi training config normally uses LoadFlowCache and DelaySlowImage.
@@ -74,7 +98,15 @@ def _create_inference_data_factory(train_config: _config.TrainConfig, checkpoint
     if flow_factory is not None:
         data_factory = dataclasses.replace(
             data_factory,
-            flow=dataclasses.replace(flow_factory, load_flow_cache=False, sample_vlm_delay=False),
+            flow=dataclasses.replace(
+                flow_factory,
+                # Do not inherit the training-only resume checkpoint (or its placeholder) from
+                # the config. Replay always uses the raw inference checkpoint explicitly passed
+                # to this function.
+                sea_raft_ckpt=str(sea_raft_ckpt),
+                load_flow_cache=False,
+                sample_vlm_delay=False,
+            ),
         )
     return data_factory
 
@@ -96,6 +128,22 @@ def main():
     parser.add_argument("--jax-device", type=str, default=None, help="JAX model device (e.g. cuda:0 / gpu:1)")
     parser.add_argument("--sea-raft-device", type=str, default=None, help="SEA-RAFT torch device (e.g. cuda:0)")
     parser.add_argument(
+        "--sea-raft-precision",
+        choices=("fp32", "fp16", "bf16", "auto"),
+        default="fp16",
+        help="SEA-RAFT inference precision; fp16 uses Tensor Cores on RTX 4090 (default: fp16).",
+    )
+    parser.add_argument(
+        "--sea-raft-ckpt",
+        type=pathlib.Path,
+        default=_sea_raft.default_inference_checkpoint(),
+        help=(
+            "Raw SEA-RAFT model checkpoint for inference. The default is the repository-local "
+            "SEA-RAFT/ckpt/shadow-24k.pth; this is intentionally separate from the training "
+            "resume checkpoint."
+        ),
+    )
+    parser.add_argument(
         "--telemetry-json",
         type=pathlib.Path,
         default=None,
@@ -110,9 +158,25 @@ def main():
     if args.max_frames is not None and args.max_frames <= 0:
         raise ValueError("--max-frames must be positive")
 
+    jax_device = args.jax_device or _default_single_jax_device()
+
+    sea_raft_ckpt = args.sea_raft_ckpt.expanduser()
+    if not sea_raft_ckpt.is_file():
+        raise FileNotFoundError(
+            f"Inference SEA-RAFT checkpoint not found: {sea_raft_ckpt}. "
+            "Place the raw model checkpoint under SEA-RAFT/ckpt/shadow-24k.pth or pass "
+            "--sea-raft-ckpt explicitly."
+        )
+
     # Load the config and create the model.
-    train_config = _config.get_config(args.config_name)
-    model = _checkpoints.load_model_from_checkpoint(train_config.model, args.checkpoint)
+    train_config = _checkpoint_config.align_train_config_with_checkpoint(
+        _config.get_config(args.config_name), args.checkpoint
+    )
+    model = _checkpoints.load_model_from_checkpoint(
+        train_config.model,
+        args.checkpoint,
+        jax_device=jax_device,
+    )
     flow_cfg = train_config.model.flow
     if flow_cfg is None or not flow_cfg.enabled:
         raise ValueError("The model checkpoint must have flow enabled.")
@@ -121,7 +185,7 @@ def main():
     # runtime, but never construct training-only cache/delay transforms. The factory also points
     # at checkpoint-local assets when available, making replay independent of the training assets
     # location and ensuring normalization matches the restored weights.
-    inference_data_factory = _create_inference_data_factory(train_config, args.checkpoint)
+    inference_data_factory = _create_inference_data_factory(train_config, args.checkpoint, sea_raft_ckpt)
     data_config = inference_data_factory.create(train_config.assets_dirs, train_config.model)
 
     # Rebuild the data config with the flow pipeline disabled: the replay must feed the runtime
@@ -173,16 +237,18 @@ def main():
             ]
         )
 
-    # Build the runtime (fails fast when no SEA-RAFT checkpoint is configured).
+    # Build the runtime with the inference-only raw SEA-RAFT checkpoint. This must not use the
+    # training checkpoint: the latter may contain optimizer/scheduler state for resuming SEA-RAFT.
     sea_raft_device = args.sea_raft_device or (data_config.flow.sea_raft_device if data_config.flow else "cpu")
     runtime = flowpi_runtime.FlowPiRuntime(
         model,
         flow_config=flow_cfg,
-        sea_raft_ckpt=data_config.flow.sea_raft_ckpt if data_config.flow else None,
+        sea_raft_ckpt=sea_raft_ckpt,
         sea_raft_variant=data_config.flow.sea_raft_variant if data_config.flow else "M",
         sea_raft_iters=data_config.flow.sea_raft_iters if data_config.flow else None,
         sea_raft_device=sea_raft_device,
-        jax_device=args.jax_device,
+        sea_raft_precision=args.sea_raft_precision,
+        jax_device=jax_device,
         d=1,
     )
 
@@ -217,9 +283,7 @@ def main():
 
         # Fast tick (paced to the control period in realtime mode).
         loop_t0 = time.perf_counter()
-        t0 = time.perf_counter()
         acts = runtime.tick(obs)
-        runtime.stats["tick_total_ms"].append((time.perf_counter() - t0) * 1000)
         all_actions.append(acts)
         all_outputs.append((acts, np.asarray(obs.state[0])))
 
@@ -236,6 +300,7 @@ def main():
 
     # Drain the slow worker and propagate any prefill exception to the main thread.
     runtime.close()
+    runtime_metrics = runtime.metrics_summary()
 
     # Post-process the actions into robot-executable space (unnormalized + output transforms).
     actions_np = np.concatenate(all_actions, axis=0)
@@ -251,39 +316,24 @@ def main():
     np.savez(out_path, actions=actions_np)
     print(f"Saved {len(all_actions)} actions to {out_path}")
 
-    # Timing stats (f_fast / f_slow / d_VLM distributions).
-    for name, vals in runtime.stats.items():
-        if vals:
-            arr = np.array(vals)
-            print(f"{name}: mean={arr.mean():.1f}ms, min={arr.min():.1f}ms, max={arr.max():.1f}ms, n={len(arr)}")
-    if runtime.num_generation_drops:
-        print(f"dropped prefix generations: {runtime.num_generation_drops}")
-
-    # Freshness telemetry: reconstruct Age_VLM (ticks and ms) from the per-tick source ticks.
-    if runtime.telemetry:
-        ticks = np.array([t["tick"] for t in runtime.telemetry])
-        prefix_src = np.array([t["prefix_source_tick"] for t in runtime.telemetry])
-        delays = np.array(
-            [t["delay_ticks_raw"] if "delay_ticks_raw" in t else t["delay_ticks"] for t in runtime.telemetry]
-        )
-        print(
-            f"freshness: ticks={len(ticks)}, "
-            f"prefix_source_tick last={prefix_src[-1]} (of tick {ticks[-1]}), "
-            f"age_ticks mean={delays.mean():.2f} max={delays.max()} (d_max={flow_cfg.vlm_delay_max})"
-        )
-    if runtime.stats.get("prefix_age_ms_at_install"):
-        arr = np.array(runtime.stats["prefix_age_ms_at_install"])
-        print(f"prefix_age_ms_at_install: mean={arr.mean():.1f}ms, max={arr.max():.1f}ms, n={len(arr)}")
+    print(
+        flowpi_runtime.format_metrics_table(
+            runtime_metrics,
+            title="FlowPi Offline Replay 推理指标 / Inference Metrics",
+        ),
+        flush=True,
+    )
 
     if args.telemetry_json is not None:
         payload = {
             "vlm_delay_max": flow_cfg.vlm_delay_max,
-            "telemetry": runtime.telemetry,
-            "stats": {name: vals for name, vals in runtime.stats.items() if vals},
+            # Keep the legacy top-level fields for fit_vlm_delay.py and add the complete
+            # latency/frequency/counter summary for deployment analysis.
+            "telemetry": runtime_metrics["telemetry"],
+            "stats": runtime_metrics["stats"],
+            "metrics": runtime_metrics,
         }
         with open(args.telemetry_json, "w") as f:
-            import json
-
             json.dump(payload, f, indent=2)
         print(f"Wrote telemetry to {args.telemetry_json}")
 

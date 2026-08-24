@@ -13,7 +13,8 @@ uv sync --group dev
 
 # Verify JAX GPU access
 uv run python -c "import jax; print(jax.devices())"
-# Expected: [CudaDevice(id=0), CudaDevice(id=1)]  (2×4090)
+# Training/replay may use the GPUs selected by the command. The DOMINO policy server uses
+# CUDA_VISIBLE_DEVICES=0,1,2 and expects three CudaDevice entries.
 ```
 
 All dependencies are installed in `.venv/` (JAX GPU, PyTorch cu126, Flax, lerobot).
@@ -133,11 +134,78 @@ uv run python scripts/flowpi_infer.py \
   --max-frames 100
 ```
 
+Inference uses the raw SEA-RAFT model checkpoint at
+`SEA-RAFT/ckpt/shadow-24k.pth` by default. This is intentionally different from the
+training/cache checkpoint passed with `--data.flow.sea-raft-ckpt`, which may contain optimizer
+and scheduler state for resuming SEA-RAFT. Override the inference file with
+`--sea-raft-ckpt /path/to/raw_sea_raft_weights.pth` when needed.
+
 Replay accepts one or more contiguous LeRobot v3 episodes and automatically resets the
 streaming ring/prefix/action state at each `episode_index` boundary. Output is
 `{checkpoint}/replay_actions.npz` with timing stats (RAFT/prefill/NFE).
 
-## 7. Running Tests
+## 7. RoboTwin / DOMINO Simulation Inference (Four GPUs)
+
+The adapter is for RoboTwin-based simulation evaluation, not the real ALOHA control loop. For the
+DOMINO benchmark, use the double-process launcher below: the DOMINO simulation/client process is
+kept separate from the JAX policy server so DOMINO's Python package set never imports OpenPI/JAX.
+The policy server sends one 14-D qpos command per environment control step.
+
+The default device layout uses three visible GPUs:
+
+| Role | Device |
+|---|---|
+| slow VLM prefix replica | JAX `gpu:0` |
+| fast action/NFE replica | JAX `gpu:1` |
+| online SEA-RAFT | Torch `cuda:2` |
+
+The policy server uses the first three physical GPUs and the DOMINO client uses the fourth. The
+model checkpoint is the completed FlowPi checkpoint; SEA-RAFT is loaded independently from the raw
+inference checkpoint at `SEA-RAFT/ckpt/shadow-24k.pth`.
+
+```bash
+scripts/run_flowpi_domino.sh \
+  <task_name> <task_config> /path/to/flowpi_checkpoint [seed]
+```
+
+`DOMINO` is expected at `../DOMINO` beside this repository. For example:
+
+```bash
+scripts/run_flowpi_domino.sh adjust_bottle demo_clean_dynamic \
+  /path/to/flowpi_checkpoint 0
+```
+
+The task/config names are the ones defined by the local DOMINO checkout. Override runtime settings
+after the four positional arguments when needed, for example:
+
+```bash
+scripts/run_flowpi_domino.sh <task_name> <task_config> /path/to/flowpi_checkpoint 0 \
+  --test_num 1 \
+  --flowpi_slow_every_n 10 \
+  --flowpi_sea_raft_ckpt /path/to/raw_sea_raft_weights.pth
+```
+
+`run_flowpi_domino.sh` starts `DOMINO/script/policy_model_server.py` with
+`CUDA_VISIBLE_DEVICES=0,1,2` and starts `DOMINO/script/eval_policy_client.py` with
+`CUDA_VISIBLE_DEVICES=3`. Set `FLOWPI_POLICY_GPUS`, `FLOWPI_DOMINO_GPU`, `POLICY_PYTHON`,
+`DOMINO_PYTHON`, or `DOMINO_ROOT` to override these defaults. Both processes may use the same
+Python installation; the process boundary is what keeps the DOMINO client dependency-light.
+
+Each DOMINO run records metrics by default under
+`data/flowpi_metrics/<timestamp>/`: `policy_runtime.json` contains policy request latency,
+fast-tick latency/frequency, SEA-RAFT flow latency/update frequency, slow-prefix prefill and
+installation frequency, prefix age, queue coalescing, and generation drops. `domino_client.json`
+contains RPC round-trip latency, action execution time, and the client-side loop frequency.
+Override the location with `FLOWPI_METRICS_DIR`, or provide explicit
+`FLOWPI_POLICY_METRICS_PATH` / `FLOWPI_DOMINO_METRICS_PATH` paths. The first response may include
+JAX compilation, so the launcher uses a 180-second DOMINO RPC timeout by default; override it with
+`FLOWPI_DOMINO_TIMEOUT`.
+
+For a direct RoboTwin evaluator checkout (without DOMINO's client/server layer), the legacy
+`scripts/run_flowpi_robotwin.sh` entry point and `scripts/flowpi_robotwin_deploy.yml` remain
+available.
+
+## 8. Running Tests
 
 ```bash
 # Fast tests (non-slow)

@@ -1,0 +1,20 @@
+# Configuration consumed by DOMINO/script/policy_model_server.py.
+# The server process imports flowpi_robotwin_policy and owns the JAX/SEA-RAFT devices.
+policy_name: flowpi_robotwin_policy
+flowpi_checkpoint: null
+flowpi_config_name: flowpi_aloha
+flowpi_sea_raft_ckpt: null
+flowpi_slow_device: gpu:0
+flowpi_fast_device: gpu:1
+flowpi_sea_raft_device: cuda:2
+flowpi_sea_raft_precision: fp16
+flowpi_async_flow: true
+flowpi_prewarm_runtime: true
+flowpi_slow_every_n: 10
+# πR² deployment d is estimated from the measured policy-query latency in this control period.
+flowpi_control_hz: 50
+flowpi_initial_d: 1
+flowpi_d_window: 8
+# Deployment cap; the checkpoint may support d=1..5, but RoboTwin inference uses Pi-R2's 1/2/3.
+flowpi_deploy_d_max: 3
+flowpi_prompt: null

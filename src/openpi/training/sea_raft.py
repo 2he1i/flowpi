@@ -18,8 +18,6 @@ import numpy as np
 import torch
 
 _SEA_RAFT_CORE_DIR = pathlib.Path(__file__).resolve().parents[3] / "SEA-RAFT" / "core"
-_SEA_RAFT_CHECKPOINT_DIR = _SEA_RAFT_CORE_DIR.parent / "ckpt"
-_DEFAULT_INFERENCE_CHECKPOINT = _SEA_RAFT_CHECKPOINT_DIR / "shadow-24k.pth"
 
 _VARIANT_CONFIGS = {
     # variant: (dim, iters, radius, block_dims)
@@ -49,16 +47,6 @@ def checkpoint_sha256(path: str | pathlib.Path | None) -> str | None:
         for chunk in iter(lambda: file.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def default_inference_checkpoint() -> pathlib.Path:
-    """Return the repository-local raw SEA-RAFT checkpoint used by inference.
-
-    FlowPi training deliberately receives its own checkpoint through the training data config;
-    that file may be a fine-tuning/resume checkpoint containing optimizer state. Inference only
-    needs the model weights, which are kept separately under ``SEA-RAFT/ckpt``.
-    """
-    return _DEFAULT_INFERENCE_CHECKPOINT
 
 
 def _extract_model_state_dict(checkpoint: object) -> dict:

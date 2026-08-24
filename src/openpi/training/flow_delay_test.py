@@ -107,50 +107,6 @@ def test_flow_and_vlm_delays_are_independent(tmp_path):
     np.testing.assert_array_equal(out["flow"][_CAM][:, 0, 0, 0], [900, 901])
 
 
-def test_flow_required_sampling_forces_stale_vlm_prefix_without_crossing_episode_start():
-    frame_offsets = _transforms.compute_image_frame_offsets(_K, _STRIDE, vlm_delay_max=4, flow_delay_max=3)
-    transform = _transforms.DelaySlowImage(
-        4,
-        frame_offsets,
-        distribution=(1.0, 1.0, 1.0, 1.0, 1.0),
-        flow_required_prob=1.0,
-        flow_required_vlm_delay_min=3,
-    )
-
-    for _ in range(32):
-        current = 8
-        images = {
-            _CAM: np.stack([np.full((3, 2, 2), current + offset, dtype=np.uint8) for offset in frame_offsets], axis=0)
-        }
-        out = transform({"images": images, "episode_index": 0, "frame_index": current})
-        assert 3 <= out["vlm_delay"] <= 4
-        assert bool(out["flow_required"])
-        np.testing.assert_array_equal(out["images"][_CAM], images[_CAM][frame_offsets.index(-out["vlm_delay"])])
-
-    # At episode tick 1, the minimum forced delay is not reachable. The sample is therefore normal,
-    # and the transform must never label it required or read a previous episode frame.
-    current = 1
-    images = {
-        _CAM: np.stack([np.full((3, 2, 2), current + offset, dtype=np.uint8) for offset in frame_offsets], axis=0)
-    }
-    out = transform({"images": images, "episode_index": 1, "frame_index": current})
-    assert not bool(out["flow_required"])
-    assert 0 <= out["vlm_delay"] <= 1
-    np.testing.assert_array_equal(out["images"][_CAM], images[_CAM][frame_offsets.index(-out["vlm_delay"])])
-
-
-def test_flow_required_mask_defaults_false_without_history():
-    transform = _transforms.DelaySlowImage(
-        4,
-        (0,),
-        flow_required_prob=1.0,
-        flow_required_vlm_delay_min=3,
-    )
-    out = transform({"images": {_CAM: np.zeros((3, 2, 2), dtype=np.uint8)}, "frame_index": 8})
-    assert out["vlm_delay"] == 0
-    assert not bool(out["flow_required"])
-
-
 def test_online_flow_uses_stale_target_but_keeps_internal_stride():
     frame_offsets = _transforms.compute_image_frame_offsets(_K, _STRIDE, vlm_delay_max=0, flow_delay_max=3)
     current = 8

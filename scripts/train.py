@@ -1,7 +1,6 @@
 import dataclasses
 import functools
 import logging
-import math
 import platform
 from typing import Any
 
@@ -224,32 +223,6 @@ def train_step(
     return new_state, info
 
 
-def _update_flow_residual_ema(
-    previous: dict[str, float],
-    metrics: dict[str, float],
-    *,
-    log_interval: int,
-    window_steps: int,
-) -> dict[str, float]:
-    """Update EMA metrics for all Flow residual telemetry series.
-
-    The training loop reduces metrics every log_interval steps. Converting the requested
-    step window into a per-log decay keeps the effective smoothing horizon stable when
-    the log interval changes.
-    """
-    decay = math.exp(-log_interval / window_steps)
-    updated: dict[str, float] = {}
-    for key, value in metrics.items():
-        if not key.startswith("flow_ca_residual_ratio_layer") or key.endswith("_ema"):
-            continue
-        current = float(value)
-        ema_key = f"{key}_ema"
-        ema_value = current if ema_key not in previous else decay * previous[ema_key] + (1.0 - decay) * current
-        previous[ema_key] = ema_value
-        updated[ema_key] = ema_value
-    return updated
-
-
 def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
@@ -303,7 +276,6 @@ def main(config: _config.TrainConfig):
     ]
     wandb.log({"camera_views": images_to_log}, step=0)
 
-    logging.info(f"Flow residual telemetry EMA window: {config.telemetry_ema_steps} steps")
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
     logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
@@ -327,7 +299,6 @@ def main(config: _config.TrainConfig):
     )
 
     infos = []
-    flow_residual_ema: dict[str, float] = {}
     for step in pbar:
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
@@ -335,16 +306,6 @@ def main(config: _config.TrainConfig):
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
-            reduced_info = {key: float(np.asarray(value)) for key, value in reduced_info.items()}
-            flow_residual_ema.update(
-                _update_flow_residual_ema(
-                    flow_residual_ema,
-                    reduced_info,
-                    log_interval=config.log_interval,
-                    window_steps=config.telemetry_ema_steps,
-                )
-            )
-            reduced_info.update(flow_residual_ema)
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)

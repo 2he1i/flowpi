@@ -2,6 +2,9 @@
 assets/
 checkpoints/
 data/
+datasets/
+outputs/
+results/
 wandb/
 
 # Local opencode config (permission auto-approve rules, machine-specific).
@@ -188,3 +191,16 @@ cython_debug/
 #.idea/
 .vscode/
 .ruff_cache/
+
+# Local datasets, checkpoints, caches and evaluation output.
+flowpi_data
+ckpt/
+eval_metrics/
+eval_results/
+eval_videos/
+logs/
+metrics/
+sessions/
+*.npz
+*.npy
+*.pkl

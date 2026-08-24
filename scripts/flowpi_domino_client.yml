@@ -1,9 +1,0 @@
-# Configuration consumed by DOMINO/script/eval_policy_client.py.
-# This process imports only flowpi_domino_client and runs the simulation on its own GPU.
-policy_name: flowpi_domino_client
-task_name: null
-task_config: null
-ckpt_setting: flowpi
-seed: 0
-instruction_type: unseen
-test_num: 100

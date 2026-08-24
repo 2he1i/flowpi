@@ -93,7 +93,7 @@ class FlowDataConfig:
     sample_vlm_delay: bool = True
 
     def __post_init__(self) -> None:
-        from openpi.training.sea_raft import resolve_sea_raft_iters
+        from openpi.training.sea_raft import resolve_sea_raft_iters  # noqa: PLC0415
 
         object.__setattr__(self, "sea_raft_iters", resolve_sea_raft_iters(self.sea_raft_variant, self.sea_raft_iters))
 
@@ -331,7 +331,7 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
             flow_transforms: list[_transforms.DataTransformFn] = []
             if self.flow.load_flow_cache:
                 if self.flow.mode == "online":
-                    from openpi.training.sea_raft import SeaRaftFlowExtractor
+                    from openpi.training.sea_raft import SeaRaftFlowExtractor  # noqa: PLC0415
 
                     extractor = SeaRaftFlowExtractor(
                         ckpt_path=self.flow.sea_raft_ckpt or None,
@@ -732,8 +732,8 @@ def _flowpi_ablation_configs() -> tuple[TrainConfig, ...]:
         data_flow = (
             FlowDataConfig(
                 mode="cache",
-                flow_cache_dir="flowpi_data/flow_cache",
-                sea_raft_ckpt="<your-sea-raft-ckpt>",
+                flow_cache_dir=None,
+                sea_raft_ckpt=None,
                 sea_raft_device="cuda",
                 load_flow_cache=load_flow_cache,
                 sample_vlm_delay=sample_vlm_delay,
@@ -745,11 +745,10 @@ def _flowpi_ablation_configs() -> tuple[TrainConfig, ...]:
             name=name,
             model=model,
             data=LeRobotAlohaDataConfig(
-                repo_id="flowpi_data/train_dataset",
+                repo_id=tyro.MISSING,
                 default_prompt="Adjust the bottle on the table",
                 assets=AssetsConfig(
-                    assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
-                    asset_id="trossen",
+                    asset_id="flowpi",
                 ),
                 repack_transforms=_transforms.Group(
                     inputs=[
@@ -768,7 +767,7 @@ def _flowpi_ablation_configs() -> tuple[TrainConfig, ...]:
                 ),
                 flow=data_flow,
             ),
-            weight_loader=weight_loaders.FlowPiWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+            weight_loader=weight_loaders.FlowPiWeightLoader(tyro.MISSING),
             freeze_filter=model.get_freeze_filter(),
             num_train_steps=20_000,
             batch_size=32,
@@ -1133,7 +1132,7 @@ _CONFIGS = [
         data=RLDSDroidDataConfig(
             repo_id="droid",
             # Set this to the path to your DROID RLDS dataset (the parent directory of the `droid` directory).
-            rlds_data_dir="/mnt/pi-data/kevin",
+            rlds_data_dir=None,
             action_space=droid_rlds_dataset.DroidActionSpace.JOINT_POSITION,
             assets=AssetsConfig(
                 assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets/",
@@ -1234,7 +1233,7 @@ _CONFIGS = [
         data=FakeDataConfig(),
         batch_size=2,
         model=pi0_config.Pi0Config(paligemma_variant="dummy", action_expert_variant="dummy"),
-        weight_loader=weight_loaders.CheckpointWeightLoader("./checkpoints/debug/debug/9/params"),
+        weight_loader=weight_loaders.NoOpWeightLoader(),
         overwrite=True,
         exp_name="debug",
         num_train_steps=10,
@@ -1291,14 +1290,14 @@ _CONFIGS = [
             freeze_vision_encoder=True,
         ),
         data=LeRobotAlohaDataConfig(
-            repo_id="flowpi_data/train_dataset",
+            repo_id=tyro.MISSING,
             # The converted FlowPi dataset is multi-task. Read the language instruction from
             # meta/tasks.parquet instead of assigning one prompt to every episode.
             base_config=DataConfig(prompt_from_task=True),
             # All FlowPi variants share the stats computed in the adapted/delta action space.
             assets=AssetsConfig(
-                assets_dir="assets/flowpi_aloha",
-                asset_id="flowpi_data/train_dataset",
+                assets_dir=None,
+                asset_id="flowpi",
             ),
             repack_transforms=_transforms.Group(
                 inputs=[
@@ -1318,12 +1317,12 @@ _CONFIGS = [
             ),
             flow=FlowDataConfig(
                 mode="cache",
-                flow_cache_dir="flowpi_data/flow_cache",
-                sea_raft_ckpt="<your-sea-raft-ckpt>",
+                flow_cache_dir=None,
+                sea_raft_ckpt=None,
                 sea_raft_device="cuda",
             ),
         ),
-        weight_loader=weight_loaders.FlowPiWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        weight_loader=weight_loaders.FlowPiWeightLoader(tyro.MISSING),
         freeze_filter=pi0_config.Pi0Config(
             pi05=True, discrete_state_input=False, flow=pi0_config.FlowConfig(), freeze_vision_encoder=True
         ).get_freeze_filter(),

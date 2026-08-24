@@ -18,15 +18,18 @@ from openpi.shared import array_typing as at
 logger = logging.getLogger("openpi")
 
 
-def make_staircase_tau(horizon: int, d: int) -> jax.Array:
+def make_staircase_tau(horizon: int, d: int, *, centered: bool = False) -> jax.Array:
     """πR² staircase noise schedule (this repo's convention: t=1 noise, t=0 clean actions).
 
-    Positions [0, d):      t=0   (already executed / in-flight; clean inpainting, no loss)
-    Positions [d, H-d):    t=(p-d)/(H-2d)   (progressively noised future)
-    Positions [H-d, H):    t=1   (fresh Gaussian noise)
+    ``centered=False`` preserves the schedule used to train the current FlowPI checkpoint.
+    ``centered=True`` matches the public PI-R2 implementation: its interior buckets use a
+    half-bin offset, so exactly ``d`` (rather than ``d + 1``) positions are clean.
     """
+    if not 1 <= d < horizon / 2:
+        raise ValueError(f"d must satisfy 1 <= d < horizon / 2, got horizon={horizon}, d={d}")
     pos = jnp.arange(horizon)
-    mid = (pos - d) / (horizon - 2 * d)
+    half_bin = 0.5 if centered else 0.0
+    mid = (pos - d + half_bin) / (horizon - 2 * d)
     return jnp.where(pos < d, 0.0, jnp.where(pos >= horizon - d, 1.0, mid))
 
 
@@ -416,7 +419,7 @@ class Pi0(_model.BaseModel):
         flow_embedded = self.embed_flow(observation)
         if flow_embedded is not None:
             flow_tokens, flow_token_mask = flow_embedded
-            (prefix_out, suffix_out), _, flow_stats = self.PaliGemma.llm(
+            (_prefix_out, suffix_out), _, flow_stats = self.PaliGemma.llm(
                 [prefix_tokens, suffix_tokens],
                 mask=attn_mask,
                 positions=positions,
@@ -426,7 +429,7 @@ class Pi0(_model.BaseModel):
                 return_flow_stats=True,
             )
         else:
-            (prefix_out, suffix_out), _, flow_stats = self.PaliGemma.llm(
+            (_prefix_out, suffix_out), _, flow_stats = self.PaliGemma.llm(
                 [prefix_tokens, suffix_tokens],
                 mask=attn_mask,
                 positions=positions,
@@ -586,7 +589,7 @@ class Pi0(_model.BaseModel):
             return x_t + dt * v_t, time + dt
 
         def cond(carry):
-            x_t, time = carry
+            _x_t, time = carry
             # robust to floating-point error
             return time >= -dt / 2
 
@@ -621,14 +624,6 @@ class Pi0(_model.BaseModel):
         kv_cache: tuple | None
         # Prefix input mask (needed to build suffix attention masks against the cached prefix).
         prefix_mask: jax.Array
-        # Prefix token count per batch element.
-        prefix_len: jax.Array | None = None
-        # Episode-relative tick of the observation the active prefix was computed from. The slow
-        # channel delay is `current_tick - prefix_source_tick` (it includes the VLM compute
-        # latency), computed by the streaming runtime; the model methods only carry the value
-        # through. Set by `warm_start` to 0 (the prefix comes from the episode-start observation)
-        # and by the runtime when it installs a new prefix generation.
-        prefix_source_tick: jax.Array | None = None
 
     def _prefix_forward(self, observation: _model.Observation):
         """Runs the prefix (slow channel) once and returns (kv_cache, prefix_mask)."""
@@ -667,6 +662,7 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int = 10,
         d: int = 1,
+        centered_staircase: bool = False,
         noise: jax.Array | None = None,
         prefix: tuple | None = None,
     ) -> StreamingState:
@@ -691,7 +687,7 @@ class Pi0(_model.BaseModel):
         )
 
         eps = jax.random.normal(renoise_rng, clean.shape)
-        tau = make_staircase_tau(horizon, d)[None, :].repeat(batch_size, axis=0)  # [B, H]
+        tau = make_staircase_tau(horizon, d, centered=centered_staircase)[None, :].repeat(batch_size, axis=0)  # [B, H]
         x = tau[..., None] * eps + (1 - tau[..., None]) * clean
         # In-flight prefix stays exactly clean.
         x = jnp.where(tau[..., None] == 0.0, clean, x)
@@ -701,7 +697,6 @@ class Pi0(_model.BaseModel):
             tau=tau,
             kv_cache=kv_cache,
             prefix_mask=prefix_mask,
-            prefix_source_tick=jnp.zeros((batch_size,), dtype=jnp.int32),
         )
 
     def denoise_step(
@@ -711,16 +706,19 @@ class Pi0(_model.BaseModel):
         rng: at.KeyArrayLike,
         *,
         d: int = 1,
+        centered_staircase: bool = False,
+        shift_before_denoise: bool = False,
     ) -> tuple[jax.Array, StreamingState]:
         """One control tick = exactly one NFE.
 
-        1. Re-encode the fresh state token and the fresh flow tokens from the latest observation.
-        2. Euler step on all positions with t > 0 using dt = d / (H - 2d), then clamp t to >= 0.
-        3. Shift the buffer left by d and append d fresh Gaussians (t=1) at the tail.
-        4. Return the d actions at the front of the *shift* buffer (just cleaned).
+        The legacy/asynchronous PI-R2 order denoises the pre-shift buffer, then shifts and emits
+        positions ``[d:2d)``.  ``shift_before_denoise`` is the synchronous-control variant: it
+        first discards the already executed front, appends the Gaussian tail, and then performs
+        the one NFE against the fresh post-execution observation.  Both variants emit the same
+        action lineage; only the temporal phase of the model conditioning changes.
 
-        The staircase is self-similar under this operation: all t decrease by dt and the left
-        shift by d restores the original profile.
+        The per-position target restores the canonical staircase exactly after every call.  This
+        avoids boundary rounding and the non-self-similar scalar-step behavior for d > 1.
         """
         assert self.flow_config is not None, "denoise_step requires the flowpi configuration"
         observation = _model.preprocess_observation(None, observation, train=False)
@@ -729,56 +727,55 @@ class Pi0(_model.BaseModel):
         cfg = self.flow_config
         assert 1 <= d <= cfg.d_max, f"d={d} out of range [1, {cfg.d_max}]"
 
-        tau = state.tau
-        x = state.action_buffer
-        # Step size from the self-similarity derivation: all t decrease by d/(H-2d), and the left
-        # shift by d restores the staircase.
-        dt = d / (horizon - 2 * d)
-
-        # Fresh flow tokens — recomputed at EVERY NFE. This is the point of FlowPi.
-        flow_embedded = self.embed_flow(observation)
-
-        v = self._suffix_forward(observation, x, tau, state.kv_cache, state.prefix_mask, flow_embedded)
-        # Euler step toward t=0 (velocity convention: u = eps - a, x <- x - dt * v).
-        x_new = x - dt * v
-        tau_new = jnp.maximum(tau - dt, 0.0)
-        # Positions that were already clean (t=0) stay clean — no updates below t=0.
-        x_new = jnp.where(tau[..., None] > 0, x_new, x)
-
-        # Shift left by d; emit the d front actions of the *shifted* buffer (the positions that
-        # just reached the execution boundary; the pre-shift front [0:d) was already executed by
-        # the previous step / warm_start); append d fresh noise at the tail.
-        shifted = jax.lax.dynamic_slice(x_new, (0, d, 0), (batch_size, horizon - d, self.action_dim))
-        emit = jax.lax.stop_gradient(shifted[:, :d])
+        canonical_tau = make_staircase_tau(horizon, d, centered=centered_staircase)
+        canonical_tau = jnp.broadcast_to(canonical_tau[None, :], (batch_size, horizon))
         tail_rng, _ = jax.random.split(rng)
         tail = jax.random.normal(tail_rng, (batch_size, d, self.action_dim))
-        x_next = jnp.concatenate([shifted, tail], axis=1)
-        tau_shifted = jax.lax.dynamic_slice(tau_new, (0, d), (batch_size, horizon - d))
-        tau_next = jnp.concatenate([tau_shifted, jnp.ones((batch_size, d))], axis=1)
+
+        if shift_before_denoise:
+            # Synchronous controller contract: the caller supplies proprioception *after* the
+            # previous emitted action was executed.  Remove that committed-past action before
+            # asking the velocity field to condition on the fresh state.
+            shifted_x = jax.lax.dynamic_slice(
+                state.action_buffer, (0, d, 0), (batch_size, horizon - d, self.action_dim)
+            )
+            shifted_tau = jax.lax.dynamic_slice(state.tau, (0, d), (batch_size, horizon - d))
+            x_source = jnp.concatenate([shifted_x, tail], axis=1)
+            tau_source = jnp.concatenate([shifted_tau, jnp.ones((batch_size, d), dtype=state.tau.dtype)], axis=1)
+            tau_target = canonical_tau
+        else:
+            # Public PI-R2 recurrence: denoise the in-flight pre-shift buffer to the profile that
+            # will become canonical after the left shift.  Per-position delta-tau also handles
+            # the half-width boundary bins and d>1 exactly; it reduces to the old scalar step for
+            # the current legacy d=1 schedule.
+            x_source = state.action_buffer
+            tau_source = state.tau
+            tau_target = jnp.concatenate(
+                [jnp.zeros((batch_size, d), dtype=state.tau.dtype), canonical_tau[:, :-d]], axis=1
+            )
+
+        # Fresh flow tokens are recomputed at every NFE. Velocity convention: v = eps - action,
+        # hence moving from tau_source to tau_target is x <- x - delta_tau * v.
+        flow_embedded = self.embed_flow(observation)
+        v = self._suffix_forward(observation, x_source, tau_source, state.kv_cache, state.prefix_mask, flow_embedded)
+        delta_tau = jnp.maximum(tau_source - tau_target, 0.0)
+        x_target = x_source - delta_tau[..., None] * v
+        x_target = jnp.where(delta_tau[..., None] > 0, x_target, x_source)
+
+        if shift_before_denoise:
+            x_next = x_target
+        else:
+            shifted_x = jax.lax.dynamic_slice(x_target, (0, d, 0), (batch_size, horizon - d, self.action_dim))
+            x_next = jnp.concatenate([shifted_x, tail], axis=1)
+        # Construct the exact canonical profile instead of relying on repeated float32
+        # subtraction/snap tolerances.
+        tau_next = canonical_tau
+        emit = jax.lax.stop_gradient(x_next[:, :d])
 
         new_state = self.StreamingState(
             action_buffer=x_next,
             tau=tau_next,
             kv_cache=state.kv_cache,
             prefix_mask=state.prefix_mask,
-            prefix_source_tick=state.prefix_source_tick,
         )
         return emit, new_state
-
-    def refresh_prefix(self, state: StreamingState, observation: _model.Observation) -> StreamingState:
-        """Slow-channel refresh: re-run the prefix with the latest observation.
-
-        The prefix source tick is NOT touched here: the caller (streaming runtime) records the
-        tick of the observation this prefix was computed from and installs it together with the
-        new KV cache, so the delay stays `current_tick - prefix_source_tick`.
-        """
-        assert self.flow_config is not None, "refresh_prefix requires the flowpi configuration"
-        observation = _model.preprocess_observation(None, observation, train=False)
-        kv_cache, prefix_mask = self._prefix_forward(observation)
-        return self.StreamingState(
-            action_buffer=state.action_buffer,
-            tau=state.tau,
-            kv_cache=kv_cache,
-            prefix_mask=prefix_mask,
-            prefix_source_tick=state.prefix_source_tick,
-        )

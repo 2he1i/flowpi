@@ -1,176 +1,216 @@
 # FlowPI
 
-**FlowPI is an experimental high-frequency vision-feedback policy built on π0.5 / πR²-style streaming action generation, with optical flow injected into the fast Action Expert path.**
+FlowPI explores high-frequency visuomotor feedback for Vision-Language-Action policies by augmenting a π0.5-style Action Expert with optical-flow motion cues, fresh robot state, and delay-aware conditioning. The method is designed around a slow semantic pathway and lightweight fast feedback signals while preserving the pretrained VLA backbone as much as possible.
 
-The project studies a simple question: **can motion cues be refreshed more frequently than the expensive VLM prefix, and used to correct an action trajectory before the next full visual-language update arrives?**
+## Method Overview
 
-FlowPI therefore separates visual reasoning into a slow semantic path and a lightweight motion-feedback path. SEA-RAFT provides short-term optical flow; a small tokenizer converts flow fields into motion tokens; and gated cross-attention injects those tokens into selected Action Expert layers during streaming denoising.
+FlowPI extends the π0.5 architecture with four coupled components:
 
-> **Research status:** experimental. The repository contains the training pipeline, flow cache generation, FlowPI model, ablation switches, and a three-device reference runtime. The current runtime is intentionally sequential and is **not yet a production asynchronous controller**. Initial rollout behavior is encouraging, but controlled baseline and ablation evaluation is still required before attributing improvements to the flow branch.
+1. **Optical-flow feedback** from SEA-RAFT, represented as compact motion tokens.
+2. **Gated cross-attention** that injects motion information into selected Action Expert layers.
+3. **Fresh-state conditioning** that re-encodes the latest robot state in the fast suffix.
+4. **πR²-style staircase flow matching** with explicit modeling of stale semantic and motion observations.
 
----
-
-## Motivation
-
-A standard VLA policy typically couples new visual information to a relatively expensive vision-language forward pass. This creates a mismatch between:
-
-- the frequency at which the environment changes,
-- the frequency at which visual semantics can be recomputed, and
-- the frequency at which actions can be regenerated.
-
-FlowPI explores a two-timescale design:
-
-1. **Slow semantic channel** — image + language are encoded into the VLM prefix / KV cache.
-2. **Fast feedback channel** — fresh robot state and optical flow are injected while the Action Expert performs streaming NFEs.
-
-The intended behavior is not to replace semantic perception with optical flow. Optical flow only supplies **short-horizon motion evidence** that can help the action generator react between expensive semantic refreshes.
-
----
+The resulting policy keeps semantic image-language processing in the VLM prefix while giving the Action Expert direct access to higher-frequency motion and state feedback.
 
 ## Architecture
 
-```text
-                 ┌─────────────────────────────────────┐
- RGB + language ─►        Slow VLM / prefix path       │
-                 │      SigLIP + PaliGemma prefix      │
-                 └────────────────┬────────────────────┘
-                                  │ cached KV
-                                  ▼
-                           ┌───────────────┐
- fresh robot state ───────►│ Action Expert │──────► actions
-                           │   fast NFE     │
-                           └───────▲───────┘
-                                   │ gated cross-attention
-                                   │
- RGB history ─► SEA-RAFT ─► Flow tokenizer ─► flow tokens
-```
+### Base policy
 
-### 1. π0.5 backbone
+FlowPI is built on the π0.5 / PaliGemma architecture:
 
-FlowPI keeps the π0.5-style VLM + Action Expert decomposition and uses the Action Expert as the fast action-generation path.
+- SigLIP vision encoder for multi-view RGB observations.
+- PaliGemma VLM prefix for image-language semantic context.
+- A separate Action Expert conditioned through adaRMSNorm.
+- Flow-matching action generation over a fixed action horizon.
 
-When `Pi0Config.flow is None`, the model graph remains the baseline π0.5 graph.
+When `Pi0Config.flow is None`, the model graph remains identical to the baseline π0.5 implementation.
 
-### 2. Optical-flow fast path
+### Optical-flow pathway
 
-For each configured camera, SEA-RAFT estimates motion between the current frame and several historical frames. The default FlowPI configuration uses:
+For each camera, SEA-RAFT computes motion between the current frame and multiple historical frames. The default configuration uses:
 
-- `K = 2` flow history steps,
-- frame stride `Δ = 3`,
-- full-resolution flow input size `480 × 640`,
-- SEA-RAFT low-resolution flow at `H/8 × W/8`,
-- normalized and clamped flow before tokenization.
+- `num_flow_steps = 2`
+- `flow_stride_frames = 3`
+- `flow_image_size = (480, 640)`
+- low-resolution flow at `H/8 × W/8`
 
-The flow cache is generated offline during training so SEA-RAFT is not part of the policy backward pass.
+The policy receives normalized 2-D flow fields rather than RGB frame differences. Multiple temporal offsets provide a short motion history while keeping the fast representation compact.
 
-### 3. Flow tokenizer
+Flow is normalized before entering the policy using:
 
-Low-resolution 2-D flow fields are converted into a compact sequence of motion tokens by `FlowTokenizer`.
+- `flow_scale = 4.0`
+- `flow_clamp = 8.0`
 
-The tokenizer also receives flow age / delay information so the model can distinguish fresh motion estimates from stale ones.
+### Flow tokenizer
 
-### 4. Gated flow cross-attention
+Raw flow fields are converted into motion tokens by a lightweight convolutional tokenizer followed by positional encoding and projection into the Action Expert width.
 
-Flow tokens are injected into selected Action Expert layers through dedicated cross-attention blocks.
-
-Default injection layers:
+Default tokenizer configuration:
 
 ```text
-7, 12, 16
+channels = (32, 64, 128)
+MLP hidden = 512
 ```
 
-Each injected residual is gated, allowing the pretrained Action Expert path to remain close to its original behavior while the flow branch learns how much motion correction is useful.
+Each camera and temporal offset contributes spatial motion features. Invalid historical flow slots are masked instead of replaced with learnable dummy information.
 
-### 5. Fresh-state fast channel
+### Gated flow cross-attention
 
-Robot state can be re-encoded into the Action Expert suffix at every NFE through `flow_state_proj`.
+Flow tokens are injected directly into selected Action Expert layers through dedicated cross-attention modules.
 
-This avoids forcing the fast path to rely only on the potentially stale state information embedded in the cached slow prefix.
-
-### 6. Delay conditioning
-
-FlowPI explicitly models two different forms of staleness:
-
-- **`vlm_delay`** — age of the cached slow VLM prefix,
-- **`flow_delay`** — age of the available optical-flow observation.
-
-The Action Expert receives VLM delay through an adaRMS conditioning embedding. Flow delay is provided to the flow tokenizer.
-
-Training can sample either delay uniformly or from an empirical histogram fitted from runtime telemetry.
-
----
-
-## Streaming action generation
-
-FlowPI includes a πR²-style staircase noise schedule for streaming action updates.
-
-For an action horizon of length `H`, a sampled width `d` divides the action chunk into three regions:
+Default configuration:
 
 ```text
-[ clean / already committed ][ partially denoised ][ noise / future ]
-<--------- d ----------->                     <--- d --->
+injection layers = (7, 12, 16)
+attention heads = 8
+head dimension = 128
 ```
 
-The clean action prefix is inpainted and excluded from the training loss, while the remaining positions use position-dependent noise levels.
-
-The current training recipe mixes:
-
-- **πR² staircase samples** for streaming behavior, and
-- **standard scalar-time flow-matching samples** to retain the original denoising distribution.
-
-Default values are:
+At each injection layer, the Action Expert hidden state attends to the flow tokens. The cross-attention residual is controlled by a learned gate:
 
 ```text
-d_max       = 5
-p_standard  = 0.2
-tau_jitter  = 0.01
+h <- h + tanh(g) * CrossAttention(h, flow)
 ```
 
-The implementation also logs loss by schedule type, horizon region and noise bucket, together with flow cross-attention residual ratios.
+The gated residual lets the model learn how strongly motion information should modify the pretrained action representation. When no valid flow is available, the flow branch reduces to an identity update.
 
----
+### Fresh robot state
 
-## Ablations
+The semantic prefix may represent an older observation than the current control tick. FlowPI therefore optionally inserts a freshly encoded robot-state token into the Action Expert suffix at every denoising step.
 
-FlowPI keeps a common parameter layout across its ablations, so the same checkpoint architecture can be used while disabling individual fast-path signals.
+This pathway is controlled by:
+
+```text
+use_fresh_state = True
+```
+
+The state token is treated as conditioning information rather than as an action denoising target.
+
+### Delay-aware conditioning
+
+FlowPI explicitly distinguishes two forms of observation age.
+
+#### VLM delay
+
+`vlm_delay` measures the age of the semantic VLM prefix relative to the current control tick. A learned delay embedding is added to the Action Expert adaRMS conditioning.
+
+Default maximum:
+
+```text
+vlm_delay_max = 10
+```
+
+The delay embedding is zero-initialized so introducing the mechanism does not perturb the pretrained Action Expert before training.
+
+#### Flow delay
+
+`flow_delay` represents the age of the available optical-flow signal independently of the semantic-prefix delay.
+
+Default maximum:
+
+```text
+flow_delay_max = 2
+```
+
+Both delay variables can be sampled from empirical distributions during training. This allows the training distribution to approximate the latency profile of a deployed multi-rate system instead of assuming perfectly synchronous observations.
+
+## πR²-Style Training Objective
+
+FlowPI supports a staircase flow-matching schedule inspired by πR².
+
+For an action horizon `H`, a value `d` is sampled and the horizon is divided into three regions:
+
+- the first `d` actions are treated as already clean,
+- the middle segment receives progressively increasing noise,
+- the final `d` actions are fully noisy.
+
+The default configuration uses:
+
+```text
+d_max = 5
+p_standard = 0.2
+tau_jitter = 0.01
+```
+
+Most training samples therefore use the staircase schedule, while a fraction `p_standard` retain the standard scalar-time flow-matching objective. This mixture preserves coverage of the original π0.5 denoising distribution while training the Action Expert for streaming-style partial action refinement.
+
+The clean prefix positions are excluded from the flow-matching loss for staircase samples, and the remaining loss is renormalized so its scale remains comparable to standard π0.5 training.
+
+## Training Data
+
+FlowPI currently uses LeRobot v3 datasets together with an offline SEA-RAFT flow cache.
+
+The training pipeline is:
+
+```text
+RGB trajectories
+    ↓
+normalization statistics
+    ↓
+SEA-RAFT flow precomputation
+    ↓
+offline flow cache
+    ↓
+FlowPI policy training
+```
+
+The flow cache is computed from the original image geometry and loaded together with RGB observations and robot actions during policy training.
+
+### Image augmentation
+
+Geometric image augmentation is disabled by default for FlowPI:
+
+```text
+image_geometric_aug = False
+```
+
+The reason is geometric consistency. Optical flow is precomputed offline in the coordinate system of the raw frames; independently cropping or rotating the RGB image would place the RGB observation and cached flow in different coordinate systems.
+
+Photometric augmentation can still be applied because it does not alter the spatial correspondence between RGB and flow.
+
+## Training Configuration
+
+The main FlowPI controls are defined in `FlowConfig`.
 
 ```python
 FlowConfig(
+    enabled=True,
+    num_flow_steps=2,
+    flow_stride_frames=3,
+    flow_scale=4.0,
+    flow_clamp=8.0,
+    flow_image_size=(480, 640),
+    tokenizer_channels=(32, 64, 128),
+    tokenizer_mlp_hidden=512,
+    num_cross_heads=8,
+    cross_head_dim=128,
+    injection_layers=(7, 12, 16),
+    d_max=5,
+    p_standard=0.2,
+    tau_jitter=0.01,
+    vlm_delay_max=10,
+    flow_delay_max=2,
     use_fresh_state=True,
     use_delay=True,
     use_flow=True,
     use_pir2=True,
+    image_geometric_aug=False,
 )
 ```
 
-Available switches:
+### Ablations
 
-| Switch | Meaning |
+The main method components can be disabled independently:
+
+| Option | Function |
 | --- | --- |
-| `use_flow` | Flow tokenizer + gated flow cross-attention |
-| `use_fresh_state` | Fresh robot-state token in every fast NFE |
-| `use_delay` | Slow-prefix age conditioning |
-| `use_pir2` | πR² staircase schedule instead of standard scalar-time FM |
+| `use_flow` | Flow tokenizer and gated cross-attention |
+| `use_fresh_state` | Fresh robot-state token in the Action Expert suffix |
+| `use_delay` | VLM-delay conditioning |
+| `use_pir2` | πR² staircase noise schedule |
 
-These switches are intended for controlled attribution rather than defining separate model architectures.
-
----
-
-## Data and optical-flow cache
-
-FlowPI currently targets LeRobot v3 datasets with three RGB cameras:
-
-```text
-base_0_rgb
-left_wrist_0_rgb
-right_wrist_0_rgb
-```
-
-Training uses an **offline SEA-RAFT cache**. This keeps policy training deterministic with respect to the flow model and avoids repeatedly running a Torch optical-flow network inside the JAX training loop.
-
-Because cached flow is computed in the coordinate system of the raw image, FlowPI disables geometric image augmentation by default. Photometric augmentation can still be used without breaking image/flow spatial alignment.
-
----
+These switches gate the forward use of each component without changing the FlowPI parameter layout. This allows the same model architecture and checkpoint format to be used across ablations.
 
 ## Setup
 
@@ -186,11 +226,7 @@ The pinned SEA-RAFT submodule is patched by:
 third_party/sea_raft/flowpi_return_low_res.patch
 ```
 
-The patch adds the low-resolution flow API used by FlowPI, avoids unnecessary ImageNet initialization when restoring a trained SEA-RAFT model, and makes large correlation sampling safe.
-
-SEA-RAFT weights are external and are not stored in this repository.
-
----
+The patch exposes low-resolution flow output, avoids unnecessary ImageNet initialization when restoring a checkpoint, and makes large correlation sampling safe. SEA-RAFT weights are external and are not stored in this repository.
 
 ## Training
 
@@ -204,7 +240,7 @@ uv run python scripts/compute_norm_stats.py flowpi_aloha \
   --data.flow.enabled false
 ```
 
-### 2. Precompute SEA-RAFT flow
+### 2. Precompute optical flow
 
 ```bash
 uv run python scripts/precompute_flow_cache.py flowpi_aloha \
@@ -230,109 +266,45 @@ uv run python scripts/train.py flowpi_aloha \
   --weight-loader.params-path gs://openpi-assets/checkpoints/pi05_base/params
 ```
 
-`--checkpoint-base-dir`, `--data.repo-id`, `--data.flow.flow-cache-dir`, `--data.flow.sea-raft-ckpt`, and `--weight-loader.params-path` are independent paths. The repository does not assume local datasets, caches, checkpoints, or SEA-RAFT weights.
+The dataset, flow cache, SEA-RAFT checkpoint, π0.5 initialization, and FlowPI checkpoints are independent paths and do not need to live inside the repository.
 
----
+## Inference Partitioning
 
-## Reference inference runtime
+The intended FlowPI system separates inference into three logical compute paths:
 
-The repository currently provides a **sequential three-device reference runner**:
-
-```bash
-uv run python scripts/flowpi_infer.py \
-  --config-name flowpi_aloha \
-  --checkpoint /path/to/checkpoint/step \
-  --dataset /path/to/lerobot-dataset \
-  --output /path/to/results/actions.npz \
-  --sea-raft-ckpt /path/to/sea-raft.pth \
-  --slow-jax-device gpu:0 \
-  --fast-jax-device gpu:1 \
-  --sea-raft-device cuda:2
-```
-
-The three logical devices are:
-
-| Device | Role |
+| Path | Responsibility |
 | --- | --- |
-| GPU 0 | Slow VLM prefix / KV-cache computation |
-| GPU 1 | Fast Action Expert streaming NFE |
-| GPU 2 | SEA-RAFT optical flow |
+| **Slow semantic path** | VLM image-language prefix / semantic context |
+| **Fast action path** | Action Expert streaming update using fresh state and flow tokens |
+| **Optical-flow path** | SEA-RAFT motion estimation |
 
-For each input frame, the current reference runtime executes:
+A natural deployment maps these paths to three GPUs so semantic inference, fast action updates, and optical-flow extraction can be isolated computationally. The README intentionally does not specify a particular runtime scheduler or evaluation implementation.
 
-```text
-flow → slow prefix refresh → one fast NFE
-```
-
-It then writes the requested action array to `.npz`.
-
-### Important limitation
-
-This runner is deliberately minimal. It currently has no:
-
-- simulator adapter,
-- asynchronous producer/consumer channels,
-- wall-clock frequency controller,
-- dynamic action-width scheduler,
-- automatic slow-prefix refresh policy,
-- production robot interface.
-
-The architectural separation is designed to support a later asynchronous implementation, but the current runner should be interpreted as a correctness / integration reference rather than a measured high-frequency deployment stack.
-
----
-
-## Verification
-
-CPU/static checks are kept separate from hardware validation.
-
-```bash
-uv run ruff check \
-  src/openpi/models/pi0.py \
-  src/openpi/policies/flowpi_runtime.py \
-  src/openpi/training/sea_raft.py \
-  scripts/flowpi_infer.py \
-  scripts/flowpi_checkpoint.py \
-  scripts/compute_norm_stats.py
-
-uv run python -m compileall -q src scripts
-```
-
-GPU training, SEA-RAFT validation and rollout evaluation are intentionally not part of the basic verification command.
-
----
-
-## Current research questions
-
-The repository is being used to evaluate several hypotheses rather than presenting a finished benchmark result:
-
-1. Does optical-flow feedback improve recovery from target or object motion between slow VLM updates?
-2. How much of any improvement comes from flow itself versus fresh proprioceptive state or πR² streaming?
-3. How sensitive is the fast path to VLM-prefix and flow latency distributions?
-4. What flow refresh rate is sufficient before SEA-RAFT latency becomes the system bottleneck?
-5. Can the slow VLM, fast Action Expert and optical-flow estimator be scheduled asynchronously without destabilizing action generation?
-
-The intended evaluation therefore requires matched baselines and ablations, not only successful rollout examples.
-
----
-
-## Repository layout
+## Repository Structure
 
 ```text
-src/openpi/models/pi0.py                 FlowPI model and πR² training / sampling
-src/openpi/models/pi0_config.py          FlowPI configuration and ablation switches
-src/openpi/models/flow_tokenizer.py      Optical-flow tokenizer
-src/openpi/models/gemma.py               Flow cross-attention inside the Action Expert
-src/openpi/policies/flowpi_runtime.py    Three-device reference runtime
-src/openpi/training/sea_raft.py          SEA-RAFT integration
-scripts/precompute_flow_cache.py         Offline flow-cache generation
-scripts/flowpi_infer.py                  Minimal sequential inference entry point
-scripts/fit_vlm_delay.py                 Runtime-delay distribution fitting
-```
+src/openpi/models/pi0.py
+    FlowPI forward pass, πR² objective, streaming Action Expert logic
 
----
+src/openpi/models/pi0_config.py
+    FlowConfig and model configuration
+
+src/openpi/models/flow_tokenizer.py
+    Optical-flow tokenization
+
+src/openpi/models/gemma.py
+    Gated flow cross-attention inside the Action Expert
+
+src/openpi/training/sea_raft.py
+    SEA-RAFT integration
+
+scripts/precompute_flow_cache.py
+    Offline optical-flow cache generation
+
+scripts/fit_vlm_delay.py
+    Delay-distribution fitting utilities
+```
 
 ## Acknowledgements
 
-FlowPI is built on the OpenPI / π0.5 codebase and uses SEA-RAFT for optical-flow estimation. The streaming action-generation design is inspired by πR²-style fast/slow policy execution.
-
-Please refer to the upstream projects for their original implementations, licenses, checkpoints and citations.
+FlowPI builds on the OpenPI / π0.5 codebase, πR²-style streaming action generation, and SEA-RAFT optical-flow estimation.

@@ -4,22 +4,22 @@ FlowPI explores high-frequency visuomotor feedback for Vision-Language-Action po
 
 ## 📚 Contents
 
-- [🧠 Method Overview](#method-overview)
-- [🏗️ Architecture](#architecture)
+- [Method Overview](#method-overview)
+- [Architecture](#architecture)
   - [Base policy](#base-policy)
   - [Optical-flow pathway](#optical-flow-pathway)
   - [Flow tokenizer](#flow-tokenizer)
   - [Gated flow cross-attention](#gated-flow-cross-attention)
   - [Fresh robot state](#fresh-robot-state)
   - [Delay-aware conditioning](#delay-aware-conditioning)
-- [🧮 πR²-Style Training Objective](#πr²-style-training-objective)
-- [📦 Training Data](#training-data)
-- [⚙️ Training Configuration](#training-configuration)
-- [🛠️ Setup](#setup)
-- [🚂 Training](#training)
-- [🧩 Inference Partitioning](#inference-partitioning)
-- [🗂️ Repository Structure](#repository-structure)
-- [🙏 Acknowledgements](#acknowledgements)
+- [πR²-Style Training Objective](#πr²-style-training-objective)
+- [Training Data](#training-data)
+- [Training Configuration](#training-configuration)
+- [Setup](#setup)
+- [Training](#training)
+- [Inference Partitioning](#inference-partitioning)
+- [Repository Structure](#repository-structure)
+- [Acknowledgements](#acknowledgements)
 
 <a id="method-overview"></a>
 ## 🧠 Method Overview
